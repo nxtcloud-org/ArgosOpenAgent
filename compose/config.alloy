@@ -1,0 +1,81 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ── 메트릭 1) 호스트 OS (node_exporter 내장) ──
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/rootfs"
+  filesystem {
+    mount_points_exclude = "^/(dev|proc|sys|run|var/lib/docker/.+|host/.+|boot/efi)($|/)"
+    fs_types_exclude     = "^(autofs|binfmt_misc|cgroup|cgroup2|configfs|debugfs|devpts|devtmpfs|efivarfs|fusectl|hugetlbfs|iso9660|mqueue|nfs|nfs4|nfsd|nsfs|overlay|proc|procfs|pstore|ramfs|rpc_pipefs|securityfs|selinuxfs|squashfs|sunrpc|sysfs|tracefs|tmpfs|vfat)$"
+    mount_timeout        = "5s"
+  }
+}
+discovery.relabel "host" {
+  targets = prometheus.exporter.unix.host.targets
+  rule { target_label = "job";      replacement = "node" }
+  rule { target_label = "instance"; replacement = sys.env("INSTANCE_ID") }
+  rule { target_label = "node";     replacement = sys.env("NODE_NAME") }
+}
+prometheus.scrape "host" {
+  targets         = discovery.relabel.host.output
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+}
+
+// ── 메트릭 2) 컨테이너 (cAdvisor 내장) ──
+prometheus.exporter.cadvisor "containers" {
+  docker_host      = "unix:///var/run/docker.sock"
+  storage_duration = "5m"
+}
+discovery.relabel "containers" {
+  targets = prometheus.exporter.cadvisor.containers.targets
+  rule { target_label = "instance"; replacement = sys.env("INSTANCE_ID") }
+  rule { target_label = "node";     replacement = sys.env("NODE_NAME") }
+}
+prometheus.scrape "containers" {
+  targets         = discovery.relabel.containers.output
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+  job_name        = "cadvisor"
+}
+
+// ── 메트릭 push ──
+prometheus.remote_write "mimir" {
+  endpoint { url = sys.env("MIMIR_ENDPOINT") }
+  external_labels = { cluster = "poc" }
+}
+
+// ── 로그 1) 컨테이너 (docker.sock tail) ──
+discovery.docker "logs" { host = "unix:///var/run/docker.sock" }
+discovery.relabel "logs" {
+  targets = discovery.docker.logs.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule { target_label = "instance"; replacement = sys.env("INSTANCE_ID") }
+  rule { target_label = "node";     replacement = sys.env("NODE_NAME") }
+}
+loki.source.docker "logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.logs.output
+  labels     = { job = "docker" }
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ── 로그 2) systemd journald ──
+loki.source.journal "system" {
+  forward_to = [loki.write.loki.receiver]
+  labels     = { job = "systemd-journal", instance = sys.env("INSTANCE_ID"), node = sys.env("NODE_NAME") }
+}
+
+// ── 로그 push ──
+loki.write "loki" {
+  endpoint { url = sys.env("LOKI_ENDPOINT") }
+  external_labels = { cluster = "poc" }
+}

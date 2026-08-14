@@ -1,0 +1,62 @@
+# ArgosOpen Agent — Alloy 모니터링 에이전트
+services:
+  alloy:
+    image: grafana/alloy:latest
+    container_name: argos-alloy
+    restart: unless-stopped
+    cgroup: host
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      MIMIR_ENDPOINT: ${MIMIR_ENDPOINT}
+      LOKI_ENDPOINT: ${LOKI_ENDPOINT}
+      INSTANCE_ID: ${INSTANCE_ID}
+      NODE_NAME: ${NODE_NAME}
+    ports: ["12345:12345"]
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/udev:/run/udev:ro
+      - /:/rootfs:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:12345/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      - "autoheal=true"
+    networks: [argos]
+
+  # 헬스체크 실패 시 자동 재시작
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: argos-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: "autoheal"
+      AUTOHEAL_INTERVAL: 30
+      AUTOHEAL_START_PERIOD: 60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [argos]
+
+volumes:
+  alloy-data:
+
+networks:
+  argos:
