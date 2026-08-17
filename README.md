@@ -153,10 +153,20 @@ cd /opt/argos-agent && sudo docker compose up -d
 
 ## 컨테이너 구성
 
-| 컨테이너 | 역할 |
-|---------|------|
-| `argos-alloy` | 메트릭·로그 수집 후 push. healthcheck: `:12345/-/ready` |
-| `argos-autoheal` | healthcheck 실패 시 자동 재시작 |
+| 컨테이너 | 이미지 | 역할 |
+|---------|--------|------|
+| `argos-alloy` | `grafana/alloy:v1.18.0` | 메트릭·로그 수집 후 push. healthcheck: `:12345/-/ready` |
+| `argos-autoheal` | `willfarrell/autoheal@sha256:b9b7a5e…` | healthcheck 실패 시 자동 재시작 |
+
+`latest`를 쓰지 않고 고정합니다 — 노드마다 다른 버전이 깔리는 걸 막기 위함입니다.
+Alloy 버전이 다르면 수집 항목·라벨이 미묘하게 어긋날 수 있습니다.
+
+autoheal 만 태그가 아니라 digest 로 고정했습니다. 버전 태그가 2021년 `1.2.0` 에서 멈춰 있고
+`latest` 는 계속 갱신되는(사실상 main) 이미지라, "지금 돌고 있는 내용"을 그대로 굳히려면
+digest 가 유일한 방법입니다.
+
+업그레이드는 `compose/docker-compose.yml`을 고쳐 커밋으로 남깁니다.
+`docker compose pull`만으로는 버전이 올라가지 않습니다.
 
 `restart: unless-stopped`는 프로세스가 죽었을 때만 살립니다. Alloy가 살아는 있지만
 수집이 멈춘 상태는 못 잡기 때문에 autoheal을 따로 둡니다.
