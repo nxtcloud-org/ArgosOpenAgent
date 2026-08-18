@@ -228,6 +228,28 @@ Go 정규식(RE2)에는 부정 룩어헤드가 없어 not-match로 뒤집어 dro
 - **버려진 줄은 복구할 수 없습니다.** 장애 원인은 보통 에러 "직전"의 INFO에 있으니,
   특정 컨테이너가 폭주하는 게 확인된 경우가 아니면 켜지 마세요.
 
+## 운영 환경 전환 시 변경 사항
+
+PoC에서 실제 운영으로 전환할 때 확인해야 할 항목:
+
+| 항목 | 파일 | 현재 (PoC) | 운영 시 변경 |
+|------|------|-----------|------------|
+| 클러스터 라벨 | `compose/config.alloy` 85, 124번 줄 | `cluster = "poc"` | 고객사/환경에 맞게 변경 (예: `"uc"`, `"prod"`) |
+| 파일시스템 수집 제외 | `compose/config.alloy` 32번 줄 `fs_types_exclude` | `nfs\|nfs4` 제외 해제됨 | EFS 사용 시 `nfs4`가 제외 목록에 없는지 확인 |
+| Alloy 이미지 버전 | `compose/docker-compose.yml` | `grafana/alloy:v1.18.0` | 운영 안정 버전으로 고정 유지 |
+| 로그 필터 | `LOG_KEEP_REGEX` 환경변수 | 미설정 (전량 수집) | 필요 시 설정 |
+
+```bash
+# 클러스터 라벨 변경 예시
+sed -i 's/cluster = "poc"/cluster = "uc"/' compose/config.alloy
+KEEP_ENV=1 sudo ./init agent <중앙노드_IP>
+cd /opt/argos-agent && sudo docker compose restart
+```
+
+> **주의**: 클러스터 라벨을 변경하면 변경 이전 데이터는 기존 라벨(`poc`)로 남아있습니다.
+> Grafana 대시보드에서 `cluster` 필터를 사용하는 경우 양쪽 값을 모두 포함하도록 설정하거나,
+> 전환 시점을 기준으로 대시보드 시간 범위를 맞추세요.
+
 ## 요구사항
 
 - Linux (dnf / yum / apt 중 하나)
