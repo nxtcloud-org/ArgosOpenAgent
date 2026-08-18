@@ -29,7 +29,7 @@ prometheus.exporter.unix "host" {
   rootfs_path = "/rootfs"
   filesystem {
     mount_points_exclude = "^/(dev|proc|sys|run|var/lib/docker/.+|host/.+|boot/efi)($|/)"
-    fs_types_exclude     = "^(autofs|binfmt_misc|cgroup|cgroup2|configfs|debugfs|devpts|devtmpfs|efivarfs|fusectl|hugetlbfs|iso9660|mqueue|nfs|nfs4|nfsd|nsfs|overlay|proc|procfs|pstore|ramfs|rpc_pipefs|securityfs|selinuxfs|squashfs|sunrpc|sysfs|tracefs|tmpfs|vfat)$"
+    fs_types_exclude     = "^(autofs|binfmt_misc|cgroup|cgroup2|configfs|debugfs|devpts|devtmpfs|efivarfs|fusectl|hugetlbfs|iso9660|mqueue|nfsd|nsfs|overlay|proc|procfs|pstore|ramfs|rpc_pipefs|securityfs|selinuxfs|squashfs|sunrpc|sysfs|tracefs|tmpfs|vfat)$"
     mount_timeout        = "5s"
   }
 }
