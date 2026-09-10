@@ -60,6 +60,15 @@ prometheus.scrape "host" {
 prometheus.exporter.cadvisor "containers" {
   docker_host      = "unix:///var/run/docker.sock"
   storage_duration = "5m"
+  // 컨테이너의 Docker 라벨을 메트릭 라벨(container_label_*)로 바꾸지 않는다.
+  // 기본값 true 로 두면 compose 가 자동으로 박는 라벨이 전부 따라 들어온다
+  // (com.docker.compose.config-hash / .project.config_files / .depends_on …).
+  // 여기에 이미지의 org.opencontainers.image.* 까지 얹히면 차원이 4개인
+  // container_blkio_device_usage_total 이 31개가 되어 Mimir 기본 한도 30을 넘고,
+  // remote-write 요청이 400 으로 거부된다. 그러면 그 시리즈만 빠지는 게 아니라
+  // 같은 배치의 container_cpu·memory·network·last_seen 까지 함께 유실된다(실측).
+  // 대시보드와 알림 규칙은 container_label_* 을 한 곳도 참조하지 않는다.
+  store_container_labels = false
 }
 discovery.relabel "containers" {
   targets = prometheus.exporter.cadvisor.containers.targets
