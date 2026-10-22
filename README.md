@@ -128,9 +128,41 @@ cd /opt/argos-agent && sudo docker compose up -d
 | 로그 | 컨테이너 stdout/stderr | docker.sock tail |
 | 로그 | systemd journal (SSH, sudo 등) | journald |
 | 감사 | 명령 실행 기록 | cmdaudit (PROMPT_COMMAND → journald) |
+| 로그 | 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`, 기본 꺼짐) | loki.source.file |
 
 모든 시계열·로그에 `instance`(고유 식별자)와 `node`(사람이 읽는 이름) 라벨이 붙습니다.
 호스트 메트릭은 `job=node`로 정규화됩니다.
+
+### 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`)
+
+앱이 디스크에 직접 쓰는 파일 로그를 중앙 Loki 로 보냅니다. **기본은 꺼져 있고**, 설치할 때 디렉터리를 주면 켜집니다.
+환경마다 로그 위치가 다르므로 경로는 옵션으로 받습니다.
+
+```bash
+sudo LOG_DIRS=/log ./init agent 10.0.0.10 --up
+sudo ./init agent 10.0.0.10 --log-dir=/log --log-dir=/data/logs --up   # 여러 개
+sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장자 지정 (기본 log,out,txt)
+```
+
+사람이 대시보드로 보는 용도가 아니라 RCA 봇 등이 LogQL 로 조회하는 원천 데이터입니다. 조회하는 쪽은 아래 형식을 따릅니다.
+
+```
+{job="file", node="<노드>", instance="<인스턴스 ID>", app="<앱>", filename="<호스트 경로>"}
+```
+
+| 라벨 | 값 |
+|---|---|
+| `app` | 지정 디렉터리 바로 아래 폴더 이름 (`LOG_DIRS=/log` 일 때 `/log/tomcat/catalina.out` → `tomcat`). 지정 디렉터리 바로 아래 파일은 그 디렉터리 이름 (`/log/app.log` → `log`) |
+| `filename` | 호스트 기준 전체 경로 |
+
+- 본문은 원문 그대로. 공백으로 시작하는 줄(Java 스택트레이스 `\tat …`)은 앞 줄에 붙여 한 건으로 보냅니다.
+- 대상은 `LOG_FILE_EXT` 확장자만. 압축(`*.gz`)·회전 사본(`catalina.out.1`, `app.log.2026-10-21`)은 보내지 않습니다.
+- **켜는 시점에 이미 있던 내용은 보내지 않고**, 그 뒤 추가분과 새로 생긴 파일(첫 줄부터)만 보냅니다.
+  `alloy-start.sh` 가 기동 때 기존 파일의 현재 크기를 읽기 위치로 기록합니다. 디렉터리마다 한 번이라,
+  나중에 디렉터리를 추가하면 그 디렉터리만 그 시점 기준으로 기록합니다.
+- 지정한 디렉터리가 아직 없어도 에러 없이 기다리다가, 생기면 10초 안에 수집을 시작합니다.
+  단 Alloy 가 뜬 **뒤에** 마운트된 볼륨은 보이지 않습니다 — 그 경우 `docker compose restart alloy`.
+- 경로는 절대 경로, 영문·숫자·`. _ - /` 만 받습니다. 서로 겹치는 디렉터리(`/log` 와 `/log/tomcat`)는 거부합니다.
 
 ## 프로젝트 구조
 
@@ -139,6 +171,7 @@ cd /opt/argos-agent && sudo docker compose up -d
 ├── compose/                    # ★ 실제 배포되는 파일 (여기가 정답)
 │   ├── docker-compose.yml      # Alloy + autoheal
 │   ├── config.alloy            # Alloy 수집 설정
+│   ├── alloy-start.sh          # Alloy 기동 래퍼 (파일 로그 첫 읽기 위치 기록)
 │   └── .env.example            # 환경변수 템플릿
 └── README.md
 ```
@@ -148,6 +181,7 @@ cd /opt/argos-agent && sudo docker compose up -d
 ```
 ├── docker-compose.yml          # compose/ 에서 복사 (내용 동일)
 ├── config.alloy                # compose/ 에서 복사 + 치환 토큰 처리
+├── alloy-start.sh              # compose/ 에서 복사 (내용 동일)
 └── .env                        # init 이 생성 (엔드포인트·노드 식별자, 0600)
 ```
 
@@ -205,6 +239,8 @@ curl -s localhost:12345/-/ready     # Alloy 헬스
 | `KEEP_ENV` | `0` | `1`이면 기존 `.env` 덮어쓰지 않음 |
 | `COMPOSE_SRC` | `<스크립트>/compose` | 설정 원본 경로 |
 | `LOG_KEEP_REGEX` | (없음) | 컨테이너 로그 필터 |
+| `LOG_DIRS` | (없음 = 수집 안 함) | 파일 로그 수집 디렉터리, 콤마로 여러 개 (`--log-dir=<경로>` 와 같음) |
+| `LOG_FILE_EXT` | `log,out,txt` | 파일 로그 확장자 |
 
 ```bash
 INSTALL_DOCKER=0 sudo ./init agent 10.0.0.10          # Docker 이미 있음
