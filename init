@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+#
+# ArgosOpen Agent — 모니터링 에이전트 원샷 부트스트랩
+#
+#   EC2마다 Alloy agent를 설치해 호스트 메트릭 + 컨테이너 메트릭 + 로그 +
+#   명령 실행 감사를 중앙 수집 서버로 push.
+#
+#   흐름:  [EC2 × N]  Alloy(agent) ──push──▶  [중앙 수집 서버]
+#
+# 이 스크립트가 하는 일 = "노드에 필요한 것"만 한다.
+#   - Docker / Compose 설치
+#   - 이 노드의 식별자(instance-id, Name 태그) 확보 → .env 생성
+#   - compose/ 의 파일을 설치 경로로 복사
+#   - 명령 실행 감사(cmdaudit) 설치
+#   - docker compose up
+#
+# 이 스크립트가 하지 않는 일:
+#   - docker-compose.yml / config.alloy 의 "내용"을 만들지 않는다.
+#     그 둘은 compose/ 아래 실제 파일이 유일한 정답이다. 컨테이너 구성이나
+#     수집 항목을 바꾸려면 이 스크립트가 아니라 compose/ 안의 파일을 고친다.
+#
+# 사용법
+#   sudo ./init agent <중앙노드_사설IP>          # 설치만
+#   sudo ./init agent <중앙노드_사설IP> --up     # 설치 + 기동
+#
+# 재현성 옵션(환경변수로 override 가능)
+#   BASE_DIR           설치 경로              (기본 /opt/argos-agent)
+#   INSTALL_DOCKER     Docker/compose 설치    (기본 1, 이미 있으면 0으로)
+#   INSTALL_GIT        git 설치               (기본 1)
+#   COMPOSE_UP         마지막에 기동 여부      (기본 0 — --up 과 동일 효과)
+#   INSTANCE_ID        이 노드 식별 라벨      (기본: EC2 instance-id, 없으면 hostname)
+#   NODE_NAME          이 노드 표시 이름      (기본: EC2 Name 태그, 없으면 INSTANCE_ID)
+#   INSTALL_CMD_AUDIT  명령 실행 감사 설치     (기본 1)
+#   COMPOSE_VERSION    compose 플러그인 버전   (기본 v2.32.4)
+#   COMPOSE_SRC        소스 디렉토리          (기본: 이 스크립트 옆의 compose/)
+#   KEEP_ENV           기존 .env 유지          (기본 0, 1이면 덮어쓰지 않음)
+#
+set -euo pipefail
+
+# ─────────────────────────── 파라미터 ───────────────────────────
+ROLE="${1:-}"
+CENTRAL_HOST="${2:-}"
+# $2 가 플래그면 중앙 IP 로 오해하지 않는다
+case "$CENTRAL_HOST" in --*) CENTRAL_HOST="" ;; esac
+
+# 기본은 "설치만 하고 기동하지 않음". 기동까지 하려면 --up.
+COMPOSE_UP="${COMPOSE_UP:-0}"
+for _arg in "$@"; do
+  case "$_arg" in
+    --up)    COMPOSE_UP=1 ;;
+    --no-up) COMPOSE_UP=0 ;;
+  esac
+done
+unset _arg
+
+BASE_DIR="${BASE_DIR:-/opt/argos-agent}"
+INSTALL_DOCKER="${INSTALL_DOCKER:-1}"
+INSTALL_GIT="${INSTALL_GIT:-1}"
+COMPOSE_VERSION="${COMPOSE_VERSION:-v2.32.4}"
+INSTALL_CMD_AUDIT="${INSTALL_CMD_AUDIT:-1}"
+KEEP_ENV="${KEEP_ENV:-0}"
+
+# 이 스크립트가 있는 디렉토리 기준으로 compose/ 를 찾는다.
+# 심볼릭 링크로 실행돼도 원본 위치를 찾도록 readlink 를 거친다.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  [[ $_self != /* ]] && _self="$_dir/$_self"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+COMPOSE_SRC="${COMPOSE_SRC:-$SCRIPT_DIR/compose}"
+
+# ── 컨테이너 로그 필터 (선택, 기본 꺼짐) ──
+#   값을 주면 "이 정규식에 매칭되지 않는" 컨테이너 로그 줄을 Alloy 단계에서 버린다.
+#   예) LOG_KEEP_REGEX='(?i)(error|warn|fatal|panic|exception)'
+#   기본값이 빈 문자열이면 전부 수집한다.
+#
+#   [경고] journald 에는 적용되지 않는다. SSH 로그인·sudo·계정 변경은
+#          INFO 레벨이라 error|warn 로 거르면 보안 감사 로그가 통째로 빈다.
+LOG_KEEP_REGEX="${LOG_KEEP_REGEX:-}"
+if [ -z "${LOG_MULTILINE_FIRSTLINE:-}" ]; then
+  LOG_MULTILINE_FIRSTLINE='^(\\d{4}-\\d{2}-\\d{2}|\\d{2}:\\d{2}:\\d{2}|\\[)'
+fi
+
+log() { printf '\033[1;32m[argos]\033[0m %s\n' "$*"; }
+err() { printf '\033[1;31m[argos:error]\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat <<'USAGE'
+사용법:
+  sudo ./init agent <중앙노드_사설IP>         # 설치만 (기동 안 함)
+  sudo ./init agent <중앙노드_사설IP> --up    # 설치 + docker compose up -d
+
+플래그:
+  --up                  마지막에 docker compose up -d 까지 수행
+  --no-up               기동하지 않음 (기본값, 명시용)
+
+환경변수:
+  INSTALL_DOCKER=0      Docker 설치 건너뛰기
+  INSTALL_GIT=0         git 설치 건너뛰기
+  INSTALL_CMD_AUDIT=0   명령 실행 감사 건너뛰기
+  LOG_KEEP_REGEX='...'  컨테이너 로그 필터 (매칭되는 줄만 전송)
+  BASE_DIR=/custom/path 설치 경로 변경
+  COMPOSE_SRC=/path     compose 소스 디렉토리 변경
+  KEEP_ENV=1            기존 .env 를 덮어쓰지 않음
+
+컨테이너 구성·수집 항목을 바꾸려면 이 스크립트가 아니라
+compose/docker-compose.yml, compose/config.alloy 를 고치세요.
+USAGE
+  exit 1
+}
+
+case "${ROLE}" in agent) ;; *) usage ;; esac
+if [ -z "$CENTRAL_HOST" ]; then
+  err "agent 역할은 중앙 노드 주소가 필요합니다."
+  usage
+fi
+
+# 소스 파일이 실제로 있는지 먼저 확인한다. 없는 채로 진행하면
+# 빈 디렉토리에 .env 만 만들어두고 "설치 완료" 라고 말하게 된다.
+for f in docker-compose.yml config.alloy; do
+  if [ ! -f "$COMPOSE_SRC/$f" ]; then
+    err "소스 파일 없음: $COMPOSE_SRC/$f"
+    err "  이 스크립트는 compose/ 의 파일을 복사합니다. 저장소를 통째로 받아서 실행하세요."
+    err "  (curl | bash 처럼 스크립트만 내려받으면 동작하지 않습니다)"
+    exit 1
+  fi
+done
+
+# ─────────────────────── 이 노드 식별자 확보 ───────────────────────
+resolve_instance_id() {
+  if [ -n "${INSTANCE_ID:-}" ]; then echo "$INSTANCE_ID"; return; fi
+  local tok iid
+  tok=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+  if [ -n "$tok" ]; then
+    iid=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" \
+          "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || true)
+  fi
+  [ -n "${iid:-}" ] && echo "$iid" || hostname
+}
+
+resolve_node_name() {
+  if [ -n "${NODE_NAME:-}" ]; then echo "$NODE_NAME"; return; fi
+  local tok name
+  tok=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+  if [ -n "$tok" ]; then
+    name=$(curl -sf -H "X-aws-ec2-metadata-token: $tok" \
+          "http://169.254.169.254/latest/meta-data/tags/instance/Name" 2>/dev/null || true)
+  fi
+  [ -n "${name:-}" ] && echo "$name" || echo "$INSTANCE_ID"
+}
+
+INSTANCE_ID="$(resolve_instance_id)"
+NODE_NAME="$(resolve_node_name)"
+log "노드 식별자 = ${INSTANCE_ID} (node=${NODE_NAME})"
+
+# ─────────────────────── Docker + Compose 설치 ───────────────────────
+# 패키지 하나를 설치한다. 배포판별 분기를 한 곳에 모은다.
+pkg_install() {
+  local pkg="$1"
+  if   command -v dnf     >/dev/null 2>&1; then dnf install -y "$pkg"
+  elif command -v yum     >/dev/null 2>&1; then yum install -y "$pkg"
+  elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y "$pkg"
+  else err "지원되는 패키지 매니저(dnf/yum/apt)를 못 찾음"; return 1
+  fi
+}
+
+# git — 이 저장소를 노드에서 직접 clone/pull 해서 설정을 갱신할 때 필요하다.
+# 없다고 수집이 멈출 이유는 없으므로 실패해도 계속 진행한다.
+install_git() {
+  if [ "$INSTALL_GIT" != "1" ]; then
+    log "INSTALL_GIT=0 → git 설치 건너뜀"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1; then
+    log "git 이미 설치됨: $(git --version)"
+    return 0
+  fi
+  log "git 설치 중..."
+  pkg_install git || { err "git 설치 실패 — 계속 진행합니다."; return 0; }
+}
+
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker 이미 설치됨: $(docker --version)"
+  else
+    log "Docker 설치 중..."
+    if command -v apt-get >/dev/null 2>&1; then pkg_install docker.io || exit 1
+    else pkg_install docker || exit 1
+    fi
+  fi
+  systemctl enable --now docker 2>/dev/null || true
+  for u in ec2-user ubuntu; do id "$u" >/dev/null 2>&1 && usermod -aG docker "$u" || true; done
+}
+
+install_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    log "Docker Compose 이미 설치됨: $(docker compose version | head -1)"
+    return
+  fi
+  log "Compose 플러그인 설치 시도(패키지)..."
+  dnf install -y docker-compose-plugin 2>/dev/null \
+    || apt-get install -y docker-compose-plugin 2>/dev/null || true
+  if docker compose version >/dev/null 2>&1; then return; fi
+
+  log "Compose 플러그인 수동 설치(${COMPOSE_VERSION})..."
+  local dir="/usr/local/lib/docker/cli-plugins"
+  local arch; arch="$(uname -m)"
+  mkdir -p "$dir"
+  curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${arch}" \
+    -o "$dir/docker-compose"
+  chmod +x "$dir/docker-compose"
+  docker compose version >/dev/null 2>&1 || { err "Compose 설치 실패"; exit 1; }
+}
+
+install_git
+
+if [ "$INSTALL_DOCKER" = "1" ]; then
+  install_docker
+  install_compose
+else
+  log "INSTALL_DOCKER=0 → Docker/compose 설치 건너뜀"
+fi
+
+# ─────────── compose/ 의 파일을 설치 경로로 복사 ───────────
+# 내용을 만들지 않는다. 그대로 옮기고, config.alloy 의 placeholder 만 치환한다.
+install_files() {
+  local d="$1"
+  mkdir -p "$d"
+
+  log "파일 복사: $COMPOSE_SRC → $d"
+  install -m 644 "$COMPOSE_SRC/docker-compose.yml" "$d/docker-compose.yml"
+  install -m 644 "$COMPOSE_SRC/config.alloy"       "$d/config.alloy"
+
+  apply_log_filter "$d"
+}
+
+# ─────────── config.alloy placeholder 치환 ───────────
+# compose/config.alloy 에는 __DOCKER_SINK__ / __FILTER_BLOCK__ 가 들어 있다.
+# LOG_KEEP_REGEX 유무에 따라 필터 블록을 끼워 넣거나 비운다.
+apply_log_filter() {
+  local d="$1"
+  local sink tmp="$d/config.alloy.tmp" blockfile="$d/.filter-block.tmp"
+  : > "$blockfile"
+
+  if [ -n "$LOG_KEEP_REGEX" ]; then
+    sink="loki.process.container_filter.receiver"
+    # stage.match 의 !~ 가 핵심이다. RE2(Go 정규식)에는 부정 룩어헤드 (?!...) 가 없어서
+    # "키워드가 없는 줄" 을 정규식 하나로 표현할 수 없다. LogQL 의 not-match 로 뒤집어
+    # "매칭되지 않는 줄을 drop" 으로 쓴다.
+    cat > "$blockfile" <<FILTER
+
+// ── 컨테이너 로그 필터 (LOG_KEEP_REGEX 지정 시에만 생성됨) ──
+// 주의: 여기서 drop 된 줄은 복구할 수 없다.
+loki.process "container_filter" {
+  forward_to = [loki.write.loki.receiver]
+
+  // 스택트레이스를 먼저 한 덩어리로 묶는다. 순서가 뒤바뀌면 첫 줄만 남고
+  // "at com.foo..." 본문이 전부 버려진다.
+  stage.multiline {
+    firstline     = "${LOG_MULTILINE_FIRSTLINE}"
+    max_wait_time = "3s"
+  }
+
+  stage.match {
+    selector            = "{container!=\"\"} !~ \"${LOG_KEEP_REGEX}\""
+    action              = "drop"
+    drop_counter_reason = "below_keep_regex"
+  }
+}
+FILTER
+    log "컨테이너 로그 필터 활성화: '${LOG_KEEP_REGEX}' 에 매칭되지 않는 줄은 버립니다."
+    log "  journald(시스템 로그)에는 적용되지 않습니다 — 보안 감사 로그 보호."
+    log "  버려진 줄 수 확인: curl -s localhost:12345/metrics | grep loki_process_dropped_lines_total"
+  else
+    sink="loki.write.loki.receiver"
+  fi
+
+  # 치환할 블록은 여러 줄이라 awk -v 로 넘길 수 없다(BSD awk 는 -v 값의 개행을
+  # "newline in string" 으로 거부한다). 임시 파일에 써서 getline 으로 읽어들인다.
+  awk -v sink="$sink" -v bf="$blockfile" '
+    { gsub(/__DOCKER_SINK__/, sink) }
+    $0 == "__FILTER_BLOCK__" {
+      while ((getline line < bf) > 0) print line
+      close(bf); next
+    }
+    { print }
+  ' "$d/config.alloy" > "$tmp" && mv "$tmp" "$d/config.alloy"
+  rm -f "$blockfile"
+
+  if grep -q '__[A-Z_]*__' "$d/config.alloy"; then
+    err "config.alloy 에 치환되지 않은 placeholder 가 남았습니다: $d/config.alloy"
+    return 1
+  fi
+}
+
+# ─────────── .env 생성 (런타임 값만) ───────────
+write_env() {
+  local d="$1"
+  if [ "$KEEP_ENV" = "1" ] && [ -f "$d/.env" ]; then
+    log "KEEP_ENV=1 → 기존 .env 유지: $d/.env"
+    return 0
+  fi
+  cat > "$d/.env" <<ENV
+# init 이 생성. 런타임 값만 담는다 — 설정 자체는 config.alloy / docker-compose.yml 참조.
+MIMIR_ENDPOINT=http://${CENTRAL_HOST}:9009/api/v1/push
+LOKI_ENDPOINT=http://${CENTRAL_HOST}:3100/loki/api/v1/push
+INSTANCE_ID=${INSTANCE_ID}
+NODE_NAME=${NODE_NAME}
+ENV
+  chmod 600 "$d/.env"
+}
+
+# ─────────── 명령 실행 감사(cmdaudit) ───────────
+install_cmd_audit() {
+  if [ "$INSTALL_CMD_AUDIT" != "1" ]; then
+    log "INSTALL_CMD_AUDIT=0 → 명령 실행 감사 설치 건너뜀"
+    return 0
+  fi
+
+  local f="/etc/profile.d/zz-cmd-audit.sh"
+
+  cat > "${f}.tmp" <<'CMDAUDIT'
+# 실행한 명령을 journald 로 보낸다 (Alloy 가 수집 → 보안 감사).
+# init 스크립트가 생성한다. 직접 수정하지 말 것 — 다음 실행 때 덮어써진다.
+#
+# 한계: PROMPT_COMMAND 는 셸 변수라 unset 하면 기록이 끊긴다. 책임 추적용이며
+#       변조 저항이 필요하면 auditd 또는 SSM 세션 로깅을 쓴다.
+
+[ -n "${BASH_VERSION:-}" ] || return 0
+case $- in *i*) ;; *) return 0 ;; esac
+command -v logger >/dev/null 2>&1 || return 0
+
+if [ -z "${__CMD_AUDIT_LOGIN:-}" ]; then
+  __CMD_AUDIT_LOGIN="$(logname 2>/dev/null)" || __CMD_AUDIT_LOGIN=""
+  [ -n "$__CMD_AUDIT_LOGIN" ] || __CMD_AUDIT_LOGIN="${SUDO_USER:-$(id -un 2>/dev/null)}"
+  export __CMD_AUDIT_LOGIN
+fi
+__CMD_AUDIT_TTY="$(tty 2>/dev/null)" || __CMD_AUDIT_TTY="-"
+
+__cmd_audit() {
+  local e n c
+  e="$(history 1 2>/dev/null)" || return 0
+  e=${e#"${e%%[![:space:]]*}"}
+  n=${e%%[[:space:]]*}
+  c=${e#*[[:space:]]}
+  c=${c#"${c%%[![:space:]]*}"}
+  [ -n "$c" ] || return 0
+  [ "$n" = "${__CMD_AUDIT_LAST:-}" ] && return 0
+  __CMD_AUDIT_LAST="$n"
+  logger -t cmdaudit -p local6.notice -- \
+    "CMDAUDIT login=${__CMD_AUDIT_LOGIN} user=$(id -un 2>/dev/null) tty=${__CMD_AUDIT_TTY} pwd=${PWD} cmd=${c}" \
+    2>/dev/null
+  return 0
+}
+
+case ";${PROMPT_COMMAND:-};" in
+  *";__cmd_audit;"*) ;;
+  *) PROMPT_COMMAND="__cmd_audit${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+esac
+CMDAUDIT
+
+  if ! bash -n "${f}.tmp" 2>/dev/null; then
+    err "명령 감사 스크립트 문법 오류 → 설치 중단(기존 파일 유지)"
+    rm -f "${f}.tmp"
+    return 1
+  fi
+
+  mv "${f}.tmp" "$f"
+  chmod 644 "$f"
+  log "명령 실행 감사 설치: $f"
+  log "  이미 열려 있는 셸에는 적용되지 않습니다 — 다시 로그인해야 기록이 시작됩니다."
+  log "  확인: logger -t cmdaudit -- 'CMDAUDIT test' && journalctl -t cmdaudit -n 3"
+}
+
+# ═══════════════════════════ 실행 ═══════════════════════════
+log "에이전트 설치: $BASE_DIR  (중앙=$CENTRAL_HOST)"
+install_files "$BASE_DIR"
+write_env     "$BASE_DIR"
+log "설치 파일 준비 완료."
+
+install_cmd_audit || err "명령 감사 설치 실패 — 에이전트 기동은 계속합니다."
+
+if [ "$COMPOSE_UP" = "1" ]; then
+  log "기동: docker compose up -d ($BASE_DIR)"
+  ( cd "$BASE_DIR" && docker compose up -d )
+  log "기동 완료."
+else
+  log "COMPOSE_UP=0 → 기동 건너뜀. 수동 기동: cd $BASE_DIR && docker compose up -d"
+fi
+
+# ─────────────────────────── 안내 ───────────────────────────
+cat <<TIP
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ArgosOpen Agent 설치 완료
+   노드: ${NODE_NAME} (${INSTANCE_ID})
+   중앙: ${CENTRAL_HOST} (Mimir :9009, Loki :3100)
+   설치 경로: ${BASE_DIR}
+
+ 설치된 파일 (compose/ 에서 복사됨):
+   ${BASE_DIR}/
+   ├── docker-compose.yml   # Alloy + autoheal  ← 원본: compose/docker-compose.yml
+   ├── config.alloy         # Alloy 수집 설정    ← 원본: compose/config.alloy
+   └── .env                 # 런타임 변수        ← init 이 생성
+
+ 구성을 바꾸려면:
+   저장소의 compose/ 안 파일을 고치고 이 스크립트를 다시 실행하세요.
+   (.env 를 보존하려면 KEEP_ENV=1)
+
+ 관리 명령:
+   cd ${BASE_DIR}
+   docker compose ps          # 상태 확인
+   docker compose logs -f     # 로그 확인
+   docker compose restart     # 재시작
+   docker compose down        # 중지
+   docker compose pull && docker compose up -d   # 업데이트
+
+ [보안그룹] 이 노드 → 중앙 노드 아웃바운드:
+   TCP 9009 (메트릭), TCP 3100 (로그)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIP

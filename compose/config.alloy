@@ -1,0 +1,134 @@
+// ArgosOpen Agent — Alloy 수집 설정
+//
+// 이 파일이 유일한 정답(single source of truth)이다. init 이 이 파일을 그대로
+// 복사해 설치 경로에 놓는다 — 스크립트 안에 사본을 만들지 않는다.
+//
+// 이 노드의 메트릭 + 로그를 중앙 수집 서버로 push.
+// 엔드포인트·식별자는 환경변수(compose env / .env)로 주입 → 설정 파일은 모든 노드 공통.
+//
+// 아래 "로그 1) 컨테이너" 섹션에 대문자+밑줄 형태의 치환 토큰 두 개가 있다.
+// init 이 LOG_KEEP_REGEX 값에 따라 각각 로그 수신자와 필터 블록으로 바꿔 넣는다.
+// 필터를 안 쓰면 loki.write 수신자와 빈 줄로 치환된다.
+// 직접 편집할 때 그 두 토큰을 지우지 말 것 — init 이 치환 실패로 중단한다.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ── 메트릭 1) 호스트 OS (node_exporter 내장) ──
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  // 컨테이너 안에서 호스트 마운트의 사용량을 재려면 반드시 필요하다.
+  // 이게 없으면 /host/proc/mounts 로 "/app·/data·/log 가 있다"는 것까진 알지만
+  // 컨테이너 안에 그 경로가 없어 statfs 에 실패하고 조용히 건너뛴다.
+  // 게다가 statfs("/") 가 컨테이너 오버레이가 놓인 파일시스템을 가리켜
+  // docker data-root 를 옮긴 노드에서는 루트 용량이 엉뚱하게 나온다.
+  // (/:/rootfs:ro 마운트는 cAdvisor 용으로 이미 걸려 있어 compose 변경은 불필요)
+  rootfs_path = "/rootfs"
+  filesystem {
+    mount_points_exclude = "^/(dev|proc|sys|run|var/lib/docker/.+|host/.+|boot/efi)($|/)"
+    fs_types_exclude     = "^(autofs|binfmt_misc|cgroup|cgroup2|configfs|debugfs|devpts|devtmpfs|efivarfs|fusectl|hugetlbfs|iso9660|mqueue|nfsd|nsfs|overlay|proc|procfs|pstore|ramfs|rpc_pipefs|securityfs|selinuxfs|squashfs|sunrpc|sysfs|tracefs|tmpfs|vfat)$"
+    mount_timeout        = "5s"
+  }
+}
+
+// job=node 로 정규화 + 이 노드 instance 라벨 부여
+discovery.relabel "host" {
+  targets = prometheus.exporter.unix.host.targets
+  rule {
+    target_label = "job"
+    replacement  = "node"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = sys.env("INSTANCE_ID")
+  }
+  rule {
+    target_label = "node"
+    replacement  = sys.env("NODE_NAME")
+  }
+}
+prometheus.scrape "host" {
+  targets         = discovery.relabel.host.output
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+}
+
+// ── 메트릭 2) 컨테이너 (cAdvisor 내장) ──
+prometheus.exporter.cadvisor "containers" {
+  docker_host      = "unix:///var/run/docker.sock"
+  storage_duration = "5m"
+  // 컨테이너의 Docker 라벨을 메트릭 라벨(container_label_*)로 바꾸지 않는다.
+  // 기본값 true 로 두면 compose 가 자동으로 박는 라벨이 전부 따라 들어온다
+  // (com.docker.compose.config-hash / .project.config_files / .depends_on …).
+  // 여기에 이미지의 org.opencontainers.image.* 까지 얹히면 차원이 4개인
+  // container_blkio_device_usage_total 이 31개가 되어 Mimir 기본 한도 30을 넘고,
+  // remote-write 요청이 400 으로 거부된다. 그러면 그 시리즈만 빠지는 게 아니라
+  // 같은 배치의 container_cpu·memory·network·last_seen 까지 함께 유실된다(실측).
+  // 대시보드와 알림 규칙은 container_label_* 을 한 곳도 참조하지 않는다.
+  store_container_labels = false
+}
+discovery.relabel "containers" {
+  targets = prometheus.exporter.cadvisor.containers.targets
+  rule {
+    target_label = "instance"
+    replacement  = sys.env("INSTANCE_ID")
+  }
+  rule {
+    target_label = "node"
+    replacement  = sys.env("NODE_NAME")
+  }
+}
+prometheus.scrape "containers" {
+  targets         = discovery.relabel.containers.output
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+  job_name        = "cadvisor"
+}
+
+// ── 메트릭 push ──
+prometheus.remote_write "mimir" {
+  endpoint { url = sys.env("MIMIR_ENDPOINT") }
+  external_labels = { cluster = "poc" }
+}
+
+// ── 로그 1) 컨테이너 (docker.sock tail) ──
+discovery.docker "logs" { host = "unix:///var/run/docker.sock" }
+discovery.relabel "logs" {
+  targets = discovery.docker.logs.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = sys.env("INSTANCE_ID")
+  }
+  rule {
+    target_label = "node"
+    replacement  = sys.env("NODE_NAME")
+  }
+}
+loki.source.docker "logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.logs.output
+  labels     = { job = "docker" }
+  forward_to = [__DOCKER_SINK__]
+}
+__FILTER_BLOCK__
+// ── 로그 2) systemd journald (시스템/서비스 로그) ──
+// 필터를 걸지 않는다. SSH 로그인(Accepted/Failed password), sudo 명령, 계정 변경은
+// 전부 INFO 레벨이라 레벨 필터에 걸리면 보안 감사 로그가 통째로 사라진다.
+loki.source.journal "system" {
+  forward_to = [loki.write.loki.receiver]
+  labels     = { job = "systemd-journal", instance = sys.env("INSTANCE_ID"), node = sys.env("NODE_NAME") }
+}
+
+// ── 로그 push ──
+loki.write "loki" {
+  endpoint { url = sys.env("LOKI_ENDPOINT") }
+  external_labels = { cluster = "poc" }
+}
