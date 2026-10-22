@@ -22,6 +22,9 @@ services:
     cgroup: host
     devices:
       - /dev/kmsg:/dev/kmsg
+    # /log 파일 수집의 첫 읽기 위치를 정한 뒤 alloy 를 실행한다(alloy-start.sh 머리 주석).
+    # 아래 command 는 그대로 alloy 인자로 넘어간다.
+    entrypoint: ["/bin/bash", "/etc/alloy/alloy-start.sh"]
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
@@ -35,6 +38,7 @@ services:
     ports: ["12345:12345"]        # Alloy UI (필요시)
     volumes:
       - ./config.alloy:/etc/alloy/config.alloy:ro
+      - ./alloy-start.sh:/etc/alloy/alloy-start.sh:ro
       - alloy-data:/var/lib/alloy/data
       # 메트릭: 호스트 OS
       - /proc:/host/proc:ro
@@ -50,6 +54,8 @@ services:
       - /sys/fs/cgroup:/sys/fs/cgroup:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
+      # 로그: /log 볼륨 파일은 위의 /:/rootfs:ro 로 읽는다(/rootfs/log). 바인드가 하위 마운트까지
+      # 따라가므로 별도 EBS 여도 보이고, /log 가 없는 노드에 빈 디렉터리를 만들지도 않는다.
       # 로그: systemd journald (시스템/서비스 로그)
       - /var/log/journal:/var/log/journal:ro
       - /run/log/journal:/run/log/journal:ro

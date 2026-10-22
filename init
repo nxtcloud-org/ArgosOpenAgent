@@ -234,6 +234,7 @@ install_files() {
   log "파일 복사: $COMPOSE_SRC → $d"
   install -m 644 "$COMPOSE_SRC/docker-compose.yml" "$d/docker-compose.yml"
   install -m 644 "$COMPOSE_SRC/config.alloy"       "$d/config.alloy"
+  install -m 755 "$COMPOSE_SRC/alloy-start.sh"     "$d/alloy-start.sh"
 
   apply_log_filter "$d"
 }

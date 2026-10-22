@@ -128,9 +128,29 @@ cd /opt/argos-agent && sudo docker compose up -d
 | 로그 | 컨테이너 stdout/stderr | docker.sock tail |
 | 로그 | systemd journal (SSH, sudo 등) | journald |
 | 감사 | 명령 실행 기록 | cmdaudit (PROMPT_COMMAND → journald) |
+| 로그 | `/log` 볼륨의 애플리케이션 로그 파일 (`*.log`·`*.out`·`*.txt`) | loki.source.file |
 
 모든 시계열·로그에 `instance`(고유 식별자)와 `node`(사람이 읽는 이름) 라벨이 붙습니다.
 호스트 메트릭은 `job=node`로 정규화됩니다.
+
+### `/log` 파일 로그 형식
+
+사람이 대시보드로 보는 용도가 아니라 RCA 봇 등이 LogQL 로 조회하는 원천 데이터입니다. 조회하는 쪽은 아래 라벨을 따릅니다.
+
+```
+{job="file", node="<노드>", instance="<인스턴스 ID>", app="<앱>", filename="<호스트 경로>"}
+```
+
+| 라벨 | 값 |
+|---|---|
+| `app` | `/log` 바로 아래 디렉터리 이름 (`/log/tomcat/catalina.out` → `tomcat`). `/log` 바로 아래 파일은 `log` |
+| `filename` | 호스트 기준 전체 경로 (`/log/tomcat/catalina.out`) |
+
+- 본문은 원문 그대로. 공백으로 시작하는 줄(Java 스택트레이스 `\tat …`)은 앞 줄에 붙여 한 건으로 보냅니다.
+- 대상은 `*.log`·`*.out`·`*.txt` 만. 압축(`*.gz`)·회전 사본(`catalina.out.1`, `app.log.2026-10-21`)은 보내지 않습니다.
+- **설치 시점에 이미 있던 내용은 보내지 않고**, 그 뒤 추가분과 새로 생긴 파일(첫 줄부터)만 보냅니다.
+  `alloy-start.sh` 가 첫 기동 때 기존 파일의 현재 크기를 읽기 위치로 기록합니다. `alloy-data` 볼륨을 지우면 그 시점 기준으로 다시 기록합니다.
+- `/log` 가 없거나 비어 있는 노드도 같은 설정으로 에러 없이 동작하고, 나중에 생긴 파일을 10초 안에 잡습니다.
 
 ## 프로젝트 구조
 
@@ -139,6 +159,7 @@ cd /opt/argos-agent && sudo docker compose up -d
 ├── compose/                    # ★ 실제 배포되는 파일 (여기가 정답)
 │   ├── docker-compose.yml      # Alloy + autoheal
 │   ├── config.alloy            # Alloy 수집 설정
+│   ├── alloy-start.sh          # Alloy 기동 래퍼 (/log 첫 읽기 위치 기록)
 │   └── .env.example            # 환경변수 템플릿
 └── README.md
 ```
@@ -148,6 +169,7 @@ cd /opt/argos-agent && sudo docker compose up -d
 ```
 ├── docker-compose.yml          # compose/ 에서 복사 (내용 동일)
 ├── config.alloy                # compose/ 에서 복사 + 치환 토큰 처리
+├── alloy-start.sh              # compose/ 에서 복사 (내용 동일)
 └── .env                        # init 이 생성 (엔드포인트·노드 식별자, 0600)
 ```
 
