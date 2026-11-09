@@ -1,0 +1,12 @@
+# ArgosOpen Agent — 30초마다 unhealthy 컨테이너 확인 (예전 autoheal 컨테이너의 AUTOHEAL_INTERVAL=30)
+# 기동 직후 유예는 compose healthcheck 의 start_period(60s)가 맡는다 — 그동안은 unhealthy 가 아니라 starting.
+[Unit]
+Description=ArgosOpen Agent: check unhealthy containers every 30s
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

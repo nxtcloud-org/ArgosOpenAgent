@@ -1,0 +1,9 @@
+# ArgosOpen Agent — unhealthy 컨테이너 재시작 (argos-autoheal.timer 가 실행)
+[Unit]
+Description=ArgosOpen Agent: restart unhealthy containers
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/argos-autoheal

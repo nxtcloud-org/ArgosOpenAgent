@@ -36,7 +36,9 @@ services:
       LOKI_ENDPOINT: ${LOKI_ENDPOINT}
       INSTANCE_ID: ${INSTANCE_ID}
       NODE_NAME: ${NODE_NAME}
-    ports: ["12345:12345"]        # Alloy UI (필요시)
+    # Alloy UI·디버그(/debug/pprof 등) 포트. 인증이 없어 외부에 열지 않는다 — 이 노드 안에서만 접속.
+    # 수집 데이터는 이 포트가 아니라 Alloy 가 중앙으로 push 한다(9009·3100 아웃바운드).
+    ports: ["127.0.0.1:12345:12345"]
     volumes:
       - ./config.alloy:/etc/alloy/config.alloy:ro
       - ./alloy-start.sh:/etc/alloy/alloy-start.sh:ro
@@ -44,10 +46,9 @@ services:
       # 메트릭: 호스트 OS
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
-      # 메트릭(cadvisor) + 로그(컨테이너): 도커 소켓
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       # 메트릭: node_exporter diskstats 의 udev 장치 메타데이터 (없으면 error 로그)
       - /run/udev:/run/udev:ro
+      # 도커 API 는 소켓을 직접 받지 않고 docker-proxy(읽기 전용)를 거친다 — docker-proxy.cfg 머리 주석
       # 메트릭(cadvisor): node_exporter와 달리 아래는 "기본 경로 그대로" 읽는다.
       # 빠지면 컨테이너 메트릭이 전부 비어 나온다.
       # (/rootfs 는 config.alloy 의 rootfs_path 로도 쓰인다 — 디스크 사용량 정확도)
@@ -55,8 +56,8 @@ services:
       - /sys/fs/cgroup:/sys/fs/cgroup:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
-      # 로그: 파일 로그(LOG_DIRS)는 위의 /:/rootfs:ro 로 읽는다(/log → /rootfs/log). 바인드가 하위
-      # 마운트까지 따라가므로 별도 볼륨이어도 보이고, 디렉터리가 없는 노드에 빈 디렉터리를 만들지도 않는다.
+      # 로그: 파일 로그(LOG_DIRS)는 여기서 읽지 않는다. 별도 컨테이너 argos-alloy-files 가 읽는다
+      #       (docker-compose.files.yml). 이 컨테이너는 / 전체가 보여서 링크로 root 파일이 새기 때문.
       # 로그: systemd journald (시스템/서비스 로그)
       - /var/log/journal:/var/log/journal:ro
       - /run/log/journal:/run/log/journal:ro
@@ -72,30 +73,33 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    # healthcheck 실패 시 호스트의 argos-autoheal 타이머가 재시작한다(host/argos-autoheal)
     labels:
       - "autoheal=true"
-    networks: [argos]
+    depends_on: [docker-proxy]
+    networks: [argos, dockerapi]
 
-  # 헬스체크 실패 시 자동 재시작.
-  # restart: unless-stopped 는 "프로세스가 죽었을 때"만 살린다. Alloy 가 살아는
-  # 있지만 수집이 멈춘 상태(=healthcheck 실패)는 못 잡으므로 별도로 둔다.
-  autoheal:
-    # 버전 태그가 2021년 1.2.0 에서 멈춰 있고 latest 는 계속 갱신된다(사실상 main).
-    # 그래서 태그가 아니라 digest 로 굳혀 "지금 돌고 있는 내용"을 그대로 고정한다.
-    # 이 digest = 2026-08-17 시점의 latest.  1.2.0 태그를 쓰면 5년 전 릴리스로 내려간다.
-    image: willfarrell/autoheal@sha256:b9b7a5e7803dad0aa12b0ffd05aece796f1ea0ac65595705da847d3438121112
-    container_name: argos-autoheal
+  # Docker API 읽기 전용 프록시 — Alloy 가 docker.sock 을 직접 잡지 않게 한다(docker-proxy.cfg 머리 주석).
+  # Docker 공식 이미지(haproxy 3.2 LTS). 소켓은 root 소유라 root 로 돌지만 권한(capability)은 전부 뺐고,
+  # 외부와 닿지 않는 내부 네트워크(dockerapi)에 Alloy 하고만 붙어 있다. 파일 로그 컨테이너는 이 망에 없다.
+  docker-proxy:
+    image: haproxy:3.2.26-alpine
+    container_name: argos-docker-proxy
     restart: unless-stopped
-    environment:
-      AUTOHEAL_CONTAINER_LABEL: "autoheal"
-      AUTOHEAL_INTERVAL: 30
-      AUTOHEAL_START_PERIOD: 60
+    user: "0:0"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
     volumes:
+      - ./docker-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [argos]
+    networks: [dockerapi]
 
 volumes:
   alloy-data:
 
 networks:
   argos:
+  # Alloy ↔ docker-proxy 전용. internal: 외부(인터넷·호스트 밖)로 나가는 경로가 없다.
+  dockerapi:
+    internal: true

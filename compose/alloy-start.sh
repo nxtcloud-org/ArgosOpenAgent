@@ -26,7 +26,10 @@ set -u
 shopt -s globstar dotglob nullglob
 
 CONFIG=/etc/alloy/config.alloy
-STATE=/var/lib/alloy/data/loki.source.file.logvol
+# 데이터 경로는 alloy 인자 --storage.path 를 따른다(compose 의 command). 없으면 Alloy 기본 경로.
+DATA=/var/lib/alloy/data
+for a in "$@"; do case "$a" in --storage.path=*) DATA=${a#--storage.path=} ;; esac; done
+STATE=$DATA/loki.source.file.logvol
 POS=$STATE/positions.yml
 SEEDED=$STATE/.seeded_dirs
 
@@ -49,16 +52,17 @@ seed_positions() {
   for d in "${_dirs[@]}"; do
     grep -qxF "$d" "$SEEDED" && continue
     new_dirs+=("$d")
-    for f in "/rootfs$d"/**/*; do
+    for f in "/logsrc$d"/**/*; do
       matched=0
       for e in "${_exts[@]}"; do [[ $f == *."$e" ]] && { matched=1; break; }; done
       [ "$matched" = 1 ] && [ -f "$f" ] || continue
-      rel=${f#"/rootfs$d"/}
+      rel=${f#"/logsrc$d"/}
       # init 의 relabel 규칙과 같게: 바로 아래 폴더 이름, 바로 아래 파일이면 디렉터리 이름
       if [[ $rel == */* ]]; then app=${rel%%/*}; else app=${d##*/}; fi
-      # 따옴표·역슬래시가 든 이름은 YAML/라벨 이스케이프가 꼬일 수 있어 건너뛴다(처음부터 읽힌다)
-      case "$f$app" in *[\'\"\\]*) continue ;; esac
-      size=$(stat -c %s "$f" 2>/dev/null) || continue
+      # 따옴표·역슬래시·개행이 든 이름은 YAML/라벨 이스케이프가 꼬일 수 있어 건너뛴다(처음부터 읽힌다).
+      # 개행은 특히 위치 파일에 임의의 줄을 끼워 넣을 수 있다.
+      case "$f$app" in *[\'\"\\]*|*$'\n'*|*$'\r'*) continue ;; esac
+      size=$(stat -L -c %s "$f" 2>/dev/null) || continue
       body+="  ? path: \"$f\""$'\n'
       body+="    labels: '{app=\"$app\", instance=\"${INSTANCE_ID}\", job=\"file\", node=\"${NODE_NAME}\"}'"$'\n'
       body+="  : \"$size\""$'\n'
