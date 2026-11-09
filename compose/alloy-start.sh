@@ -59,8 +59,9 @@ seed_positions() {
       rel=${f#"/logsrc$d"/}
       # init 의 relabel 규칙과 같게: 바로 아래 폴더 이름, 바로 아래 파일이면 디렉터리 이름
       if [[ $rel == */* ]]; then app=${rel%%/*}; else app=${d##*/}; fi
-      # 따옴표·역슬래시가 든 이름은 YAML/라벨 이스케이프가 꼬일 수 있어 건너뛴다(처음부터 읽힌다)
-      case "$f$app" in *[\'\"\\]*) continue ;; esac
+      # 따옴표·역슬래시·개행이 든 이름은 YAML/라벨 이스케이프가 꼬일 수 있어 건너뛴다(처음부터 읽힌다).
+      # 개행은 특히 위치 파일에 임의의 줄을 끼워 넣을 수 있다.
+      case "$f$app" in *[\'\"\\]*|*$'\n'*|*$'\r'*) continue ;; esac
       size=$(stat -L -c %s "$f" 2>/dev/null) || continue
       body+="  ? path: \"$f\""$'\n'
       body+="    labels: '{app=\"$app\", instance=\"${INSTANCE_ID}\", job=\"file\", node=\"${NODE_NAME}\"}'"$'\n'

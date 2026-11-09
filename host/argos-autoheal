@@ -1,0 +1,21 @@
+#!/bin/sh
+# ArgosOpen Agent — healthcheck 가 실패(unhealthy)한 컨테이너를 재시작한다.
+# systemd 타이머(argos-autoheal.timer)가 30초마다 실행한다. init 이 /usr/local/sbin 에 설치.
+#
+# 이 파일이 유일한 정답(single source of truth)이다.
+#
+# 왜 컨테이너(willfarrell/autoheal)가 아니라 호스트 스크립트인가:
+#   restart: unless-stopped 는 프로세스가 죽었을 때만 살린다. Alloy 가 살아는 있지만 수집이
+#   멈춘 상태(healthcheck 실패)는 Docker 가 스스로 재시작하지 않아서 따로 필요하다.
+#   예전에는 autoheal 컨테이너가 했는데, 그러려면 docker.sock 을 통째로 받아야 했다 — 사실상 호스트 root.
+#   그 이미지는 개인이 관리하고 버전 태그가 2021년에 멈춰 있었다. 하는 일은 아래 몇 줄이 전부라
+#   호스트에서 직접 돌리는 편이 권한을 남에게 넘기지 않는다.
+#
+# 대상: 라벨 autoheal=true 가 붙은 컨테이너 (docker-compose.yml 의 alloy, alloy-files)
+# 기록: journalctl -u argos-autoheal  (journald 로 남아 중앙 Loki 에도 간다)
+set -u
+docker ps -q --filter label=autoheal=true --filter health=unhealthy | while read -r id; do
+  name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | tr -d /)
+  echo "unhealthy → 재시작: ${name:-$id}"
+  docker restart -t 10 "$id" >/dev/null || echo "재시작 실패: ${name:-$id}" >&2
+done

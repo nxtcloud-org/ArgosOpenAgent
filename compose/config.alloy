@@ -62,7 +62,7 @@ prometheus.scrape "host" {
 
 // ── 메트릭 2) 컨테이너 (cAdvisor 내장) ──
 prometheus.exporter.cadvisor "containers" {
-  docker_host      = "unix:///var/run/docker.sock"
+  docker_host      = "tcp://docker-proxy:2375"
   storage_duration = "5m"
   // 컨테이너의 Docker 라벨을 메트릭 라벨(container_label_*)로 바꾸지 않는다.
   // 기본값 true 로 두면 compose 가 자동으로 박는 라벨이 전부 따라 들어온다
@@ -99,7 +99,7 @@ prometheus.remote_write "mimir" {
 }
 
 // ── 로그 1) 컨테이너 (docker.sock tail) ──
-discovery.docker "logs" { host = "unix:///var/run/docker.sock" }
+discovery.docker "logs" { host = "tcp://docker-proxy:2375" }
 discovery.relabel "logs" {
   targets = discovery.docker.logs.targets
   rule {
@@ -117,7 +117,7 @@ discovery.relabel "logs" {
   }
 }
 loki.source.docker "logs" {
-  host       = "unix:///var/run/docker.sock"
+  host       = "tcp://docker-proxy:2375"
   targets    = discovery.relabel.logs.output
   labels     = { job = "docker" }
   forward_to = [__DOCKER_SINK__]

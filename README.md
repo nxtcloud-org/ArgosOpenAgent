@@ -115,7 +115,7 @@ Docker가 이미 있고 스크립트를 안 쓰고 싶다면:
 
 ```bash
 sudo mkdir -p /opt/argos-agent
-sudo cp compose/docker-compose.yml compose/config.alloy compose/alloy-start.sh /opt/argos-agent/
+sudo cp compose/docker-compose.yml compose/config.alloy compose/alloy-start.sh compose/docker-proxy.cfg /opt/argos-agent/
 sudo cp compose/.env.example /opt/argos-agent/.env
 sudo vi /opt/argos-agent/.env   # 엔드포인트·노드 식별자 채우기
 
@@ -133,7 +133,7 @@ cd /opt/argos-agent && sudo docker compose up -d
 |------|------|------|
 | 메트릭 | CPU, 메모리, 디스크, 네트워크 | node_exporter (Alloy 내장) |
 | 메트릭 | 컨테이너 CPU/MEM/NET | cAdvisor (Alloy 내장) |
-| 로그 | 컨테이너 stdout/stderr | docker.sock tail |
+| 로그 | 컨테이너 stdout/stderr | Docker API (읽기 전용 프록시 경유) |
 | 로그 | systemd journal (SSH, sudo 등) | journald |
 | 감사 | 명령 실행 기록 | cmdaudit (PROMPT_COMMAND → journald) |
 | 로그 | 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`, 기본 꺼짐) | loki.source.file (별도 컨테이너) |
@@ -229,12 +229,16 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 ```
 ├── init                        # 노드 부트스트랩: ./init agent <IP>
 ├── compose/                    # ★ 실제 배포되는 파일 (여기가 정답)
-│   ├── docker-compose.yml      # Alloy + autoheal
+│   ├── docker-compose.yml      # Alloy + docker-proxy
 │   ├── config.alloy            # Alloy 수집 설정
+│   ├── docker-proxy.cfg        # Docker API 읽기 전용 프록시 설정 (haproxy)
 │   ├── docker-compose.files.yml  # 파일 로그 컨테이너 (LOG_DIRS 지정 시 override 로 설치)
 │   ├── config-files.alloy      # 파일 로그 수집 설정 (LOG_DIRS 지정 시)
 │   ├── alloy-start.sh          # Alloy 기동 래퍼 (파일 로그 첫 읽기 위치 기록)
 │   └── .env.example            # 환경변수 템플릿
+├── host/                       # 호스트에 설치되는 파일
+│   ├── argos-autoheal          # unhealthy 컨테이너 재시작 스크립트 → /usr/local/sbin
+│   └── argos-autoheal.{service,timer}  # 30초 주기 systemd 타이머 → /etc/systemd/system
 └── README.md
 ```
 
@@ -244,6 +248,7 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 ├── docker-compose.yml          # compose/ 에서 복사 (내용 동일)
 ├── config.alloy                # compose/ 에서 복사 + 치환 토큰 처리
 ├── alloy-start.sh              # compose/ 에서 복사 (내용 동일)
+├── docker-proxy.cfg            # compose/ 에서 복사 (내용 동일)
 ├── config-files.alloy          # LOG_DIRS 지정 시: compose/ 에서 복사 + 디렉터리별 수집 규칙
 ├── docker-compose.override.yml # LOG_DIRS 지정 시: docker-compose.files.yml + 디렉터리 마운트 (compose 가 자동으로 함께 읽음)
 └── .env                        # init 이 생성 (엔드포인트·노드 식별자, 0600)
@@ -255,35 +260,74 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 |---------|--------|------|
 | `argos-alloy` | `grafana/alloy:v1.18.0` | 메트릭·로그 수집 후 push. healthcheck: `:12345/-/ready` |
 | `argos-alloy-files` | `grafana/alloy:v1.18.0` | 애플리케이션 로그 파일 수집 (`LOG_DIRS` 지정 시에만). 포트 없음 |
-| `argos-autoheal` | `willfarrell/autoheal@sha256:b9b7a5e…` | healthcheck 실패 시 자동 재시작 |
+| `argos-docker-proxy` | `haproxy:3.2.26-alpine` (Docker 공식 이미지) | Docker API 읽기 전용 프록시. 포트 없음, 내부망 전용 |
 
 `latest`를 쓰지 않고 고정합니다 — 노드마다 다른 버전이 깔리는 걸 막기 위함입니다.
 Alloy 버전이 다르면 수집 항목·라벨이 미묘하게 어긋날 수 있습니다.
 
-autoheal 만 태그가 아니라 digest 로 고정했습니다. 버전 태그가 2021년 `1.2.0` 에서 멈춰 있고
-`latest` 는 계속 갱신되는(사실상 main) 이미지라, "지금 돌고 있는 내용"을 그대로 굳히려면
-digest 가 유일한 방법입니다.
+### Docker 소켓 — Alloy 는 조회만 할 수 있다
+
+Alloy 는 cAdvisor(컨테이너 메트릭)와 컨테이너 로그 수집에 Docker API 가 필요합니다.
+예전에는 `docker.sock` 을 직접 마운트했는데, `:ro` 를 붙여도 API 는 전부 쓸 수 있어서
+Alloy 가 뚫리면 `docker run -v /:/host --privileged …` 한 줄로 곧 호스트 root 였습니다.
+
+지금은 `argos-docker-proxy` 가 소켓을 대신 잡고, Alloy 에는 실제로 쓰는 조회 경로 7개만 열어 줍니다
+(`docker-proxy.cfg`). dind 실측(2026-11-09):
+
+| Alloy 네트워크에서 보낸 요청 | 결과 |
+|---|---|
+| 컨테이너 목록·정보·로그, `info`, `version` | 200 (수집 정상: 로그 3/3, cAdvisor 메트릭 정상) |
+| 컨테이너 생성·`exec`·`kill`·삭제 | **403** |
+| 컨테이너 파일 꺼내기(`archive`·`export`), 이미지 목록 | **403** |
+
+- 프록시는 외부로 나가는 경로가 없는 내부 네트워크(`dockerapi`)에 Alloy 하고만 붙어 있습니다.
+  파일 로그 컨테이너(`argos-alloy-files`)는 이 망에 없어 Docker API 에 닿지 않습니다.
+- 프록시는 root 로 돌지만(소켓이 root 소유) 권한(capability)을 전부 빼고 읽기 전용 파일시스템으로 돕니다.
+- Alloy 를 올린 뒤 컨테이너 메트릭·로그가 비면 `sudo docker logs argos-docker-proxy` 로 막힌 요청을 봅니다
+  (거부된 요청만 기록됩니다). 새 경로가 필요하면 `docker-proxy.cfg` 허용 목록에 추가합니다.
+
+호스트 `/`(`/:/rootfs:ro`)는 여전히 Alloy 에 읽기 전용으로 붙어 있습니다. cAdvisor 와 디스크 사용량 수집에
+필요해서 뺄 수 없습니다. 그래서 Alloy 를 외부에서 건드릴 수 없게 하는 것(12345 포트를 루프백에만)과
+버전을 올려 두는 것이 대응입니다.
 
 업그레이드는 `compose/docker-compose.yml`을 고쳐 커밋으로 남깁니다. `compose/docker-compose.files.yml` 의
 Alloy 버전도 같이 올려야 합니다 — 둘이 다르면 `init` 이 파일 로그 설치를 중단합니다.
 `docker compose pull`만으로는 버전이 올라가지 않습니다.
 
+### 자동 재시작 (`argos-autoheal` 타이머)
+
 `restart: unless-stopped`는 프로세스가 죽었을 때만 살립니다. Alloy가 살아는 있지만
-수집이 멈춘 상태는 못 잡기 때문에 autoheal을 따로 둡니다.
+수집이 멈춘 상태(healthcheck 실패)는 Docker 가 재시작하지 않으므로 따로 둡니다.
+
+예전에는 `willfarrell/autoheal` 컨테이너가 했는데, `docker.sock` 을 통째로 받아야 했습니다(사실상 호스트 root).
+개인이 관리하는 이미지이고 버전 태그가 2021년에 멈춰 있었습니다. 하는 일이 "unhealthy 컨테이너 재시작" 몇 줄이라
+지금은 호스트의 systemd 타이머가 30초마다 `host/argos-autoheal` 을 실행합니다.
+
+- 대상: 라벨 `autoheal=true` 컨테이너 (`argos-alloy`, `argos-alloy-files`)
+- 기록: `journalctl -u argos-autoheal` — journald 라 중앙 Loki 에도 갑니다
+- 예전 버전에서 올리면 `argos-autoheal` 컨테이너는 `--remove-orphans` 로 내려갑니다
+- systemd 가 없는 호스트에서는 경고만 하고 넘어갑니다(자동 재시작 없음)
 
 ## 관리
 
 ```bash
 cd /opt/argos-agent
 
-docker compose ps            # 상태 확인
-docker compose logs -f       # 로그
-docker compose restart       # 재시작
-docker compose down          # 중지
-docker compose pull && docker compose up -d  # 업데이트
+sudo docker compose ps            # 상태 확인
+sudo docker compose logs -f       # 로그
+sudo docker compose restart       # 재시작
+sudo docker compose down          # 중지
 
-curl -s localhost:12345/-/ready     # Alloy 헬스
+curl -s localhost:12345/-/ready     # Alloy 헬스 (이 노드 안에서만 열림)
+systemctl list-timers argos-autoheal.timer   # 자동 재시작 타이머
 ```
+
+`init` 은 일반 계정(`ec2-user`·`ubuntu`)을 docker 그룹에 넣지 않습니다. docker 그룹은 sudo 없이 호스트 root 와 같아서,
+모니터링 에이전트 설치가 사용자 권한을 바꾸지 않게 했습니다. 관리 명령은 `sudo docker …` 로 실행합니다.
+(예전 버전으로 이미 추가된 계정은 그대로 남습니다 — 빼려면 `sudo gpasswd -d ec2-user docker`)
+
+12345 포트는 `127.0.0.1` 에만 열립니다. 인증 없는 UI·디버그(`/debug/pprof`) 포트라 다른 서버에서 접속할 이유가 없습니다.
+수집 데이터는 이 포트가 아니라 Alloy 가 중앙으로 push 합니다.
 
 ## 옵션
 
@@ -298,10 +342,11 @@ curl -s localhost:12345/-/ready     # Alloy 헬스
 | `COMPOSE_UP` | `0` | `1`이면 `--up`과 동일 |
 | `INSTALL_GIT` | `1` | git 설치 |
 | `INSTALL_DOCKER` | `1` | Docker/Compose 설치 |
-| `COMPOSE_VERSION` | `v2.32.4` | Compose 플러그인 버전 |
+| `COMPOSE_VERSION` | `v2.32.4` | Compose 플러그인 버전 (패키지 설치가 안 될 때만 GitHub 에서 받음. 기본 버전은 init 에 고정한 해시로, 다른 버전은 릴리스의 `.sha256` 으로 확인 후 설치) |
 | `INSTALL_CMD_AUDIT` | `1` | 명령 실행 감사 설치 |
-| `INSTANCE_ID` | EC2 instance-id | 없으면 hostname |
-| `NODE_NAME` | EC2 Name 태그 | 없으면 `INSTANCE_ID` |
+| `INSTALL_AUTOHEAL` | `1` | unhealthy 컨테이너 자동 재시작 타이머 설치 |
+| `INSTANCE_ID` | EC2 instance-id | 없으면 hostname. 제어 문자는 지우고 `" ' \ $ `` ` `` 는 `_` 로 바꿈 |
+| `NODE_NAME` | EC2 Name 태그 | 없으면 `INSTANCE_ID`. 처리는 위와 같음 (Name 태그는 콘솔에서 누구나 바꿀 수 있어 그대로 믿지 않음) |
 | `KEEP_ENV` | `0` | `1`이면 기존 `.env` 덮어쓰지 않음 |
 | `COMPOSE_SRC` | `<스크립트>/compose` | 설정 원본 경로 |
 | `LOG_KEEP_REGEX` | (없음) | 컨테이너 로그 필터 |
