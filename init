@@ -94,6 +94,12 @@ fi
 #   설치 시점에 이미 있던 내용은 보내지 않는다(compose/alloy-start.sh). 형식은 config.alloy "로그 3".
 LOG_FILE_EXT="${LOG_FILE_EXT:-log,out,txt}"
 
+# ── 로그 전송량 상한 (config.alloy "로그 전송량 상한") ──
+#   컨테이너·로그 파일마다 초당 LOG_RATE 줄, 순간 LOG_BURST 줄까지 보내고 넘치면 버린다.
+#   journald 는 노드 전체가 한 스트림이라 2배. 0 은 받지 않는다(끄려면 큰 값을 준다).
+LOG_RATE="${LOG_RATE:-100}"
+LOG_BURST="${LOG_BURST:-1000}"
+
 log() { printf '\033[1;32m[argos]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[argos:error]\033[0m %s\n' "$*" >&2; }
 
@@ -114,6 +120,8 @@ usage() {
   LOG_KEEP_REGEX='...'  컨테이너 로그 필터 (매칭되는 줄만 전송)
   LOG_DIRS=/log         파일 로그 수집 디렉터리 (콤마로 여러 개, --log-dir=/log 와 같음)
   LOG_FILE_EXT=log,out  파일 로그 확장자 (기본 log,out,txt)
+  LOG_RATE=100          로그 전송량 상한: 컨테이너·파일마다 초당 줄 수 (기본 100, journald 는 2배)
+  LOG_BURST=1000        로그 전송량 상한: 순간 허용 줄 수 (기본 1000, journald 는 2배)
   BASE_DIR=/custom/path 설치 경로 변경
   COMPOSE_SRC=/path     compose 소스 디렉토리 변경
   KEEP_ENV=1            기존 .env 를 덮어쓰지 않음
@@ -132,7 +140,7 @@ fi
 
 # 소스 파일이 실제로 있는지 먼저 확인한다. 없는 채로 진행하면
 # 빈 디렉토리에 .env 만 만들어두고 "설치 완료" 라고 말하게 된다.
-for f in docker-compose.yml config.alloy; do
+for f in docker-compose.yml config.alloy alloy-start.sh config-files.alloy docker-compose.files.yml; do
   if [ ! -f "$COMPOSE_SRC/$f" ]; then
     err "소스 파일 없음: $COMPOSE_SRC/$f"
     err "  이 스크립트는 compose/ 의 파일을 복사합니다. 저장소를 통째로 받아서 실행하세요."
@@ -140,6 +148,11 @@ for f in docker-compose.yml config.alloy; do
     exit 1
   fi
 done
+
+if ! [[ $LOG_RATE =~ ^[1-9][0-9]*$ && $LOG_BURST =~ ^[1-9][0-9]*$ ]]; then
+  err "LOG_RATE / LOG_BURST 는 1 이상의 정수여야 합니다: LOG_RATE='$LOG_RATE' LOG_BURST='$LOG_BURST'"
+  exit 1
+fi
 
 # ─────────────────────── 이 노드 식별자 확보 ───────────────────────
 resolve_instance_id() {
@@ -251,57 +264,72 @@ install_files() {
 
   apply_file_logs "$d"
   apply_log_filter "$d"
+  apply_rate_limit "$d"
 }
 
 # ─────────── 파일 로그 수집 블록 (__FILE_LOG_BLOCK__) ───────────
-# LOG_DIRS 가 비면 빈 줄로 치환 → 수집 안 함. 값이 있으면 디렉터리마다 대상·라벨 규칙을 만든다.
+# LOG_DIRS 가 비면 파일 로그 컨테이너를 설치하지 않는다(config-files.alloy·override 삭제).
+# 값이 있으면 별도 컨테이너 argos-alloy-files 를 만든다 — 이유는 compose/config-files.alloy 머리 주석.
+#   config-files.alloy             ← compose/config-files.alloy + 디렉터리마다 대상·라벨 규칙
+#   docker-compose.override.yml    ← compose/docker-compose.files.yml + 디렉터리 마운트
 #
-# 호스트 경로 D 는 컨테이너 안에서 /rootfs/D 다. compose 의 /:/rootfs:ro 바인드가 하위 마운트까지
-# 따라가므로 별도 볼륨이어도 보인다(디렉터리를 따로 마운트하면 없는 노드에 Docker 가 빈 디렉터리를 만든다).
-# 단 Alloy 가 뜬 "뒤에" 마운트된 볼륨은 보이지 않는다 — 그 경우 docker compose restart alloy.
+# 호스트 경로 D 는 컨테이너 안에서 /logsrc/D 다(읽기 전용 바인드, 하위 마운트까지 따라감).
+# 설치 시점에 없는 디렉터리는 빼고 경고한다 — Docker 가 root 소유 빈 디렉터리를 만들면 앱이 로그를 못 쓴다.
+# 디렉터리가 생긴 뒤 init 을 다시 실행하면 추가된다.
+# Alloy 가 뜬 "뒤에" 그 디렉터리 아래에 마운트된 볼륨은 보이지 않는다 — 그 경우 docker compose restart alloy-files.
 #
 # 맨 위 주석 줄(argos-file-logs …)은 alloy-start.sh 가 읽어 기존 파일 위치를 기록하는 데 쓴다. 지우지 말 것.
 apply_file_logs() {
   local d="$1"
-  local tmp="$d/config.alloy.tmp" blockfile="$d/.file-log-block.tmp"
-  : > "$blockfile"
+  local cfg="$d/config-files.alloy" ovr="$d/docker-compose.override.yml"
+  local tmp="$d/.file-log.tmp" blockfile="$d/.file-log-block.tmp" mountfile="$d/.file-log-mounts.tmp"
+  rm -f "$cfg" "$ovr"
+  [ -n "$LOG_DIRS" ] || return 0
 
-  if [ -n "$LOG_DIRS" ]; then
-    if ! [[ $LOG_FILE_EXT =~ ^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$ ]]; then
-      err "LOG_FILE_EXT 형식 오류: '$LOG_FILE_EXT' (예: log,out,txt)"; return 1
+  if ! [[ $LOG_FILE_EXT =~ ^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$ ]]; then
+    err "LOG_FILE_EXT 형식 오류: '$LOG_FILE_EXT' (예: log,out,txt)"; return 1
+  fi
+  local dirs=() raw dir other
+  IFS=',' read -r -a _raw_dirs <<< "$LOG_DIRS"
+  for raw in "${_raw_dirs[@]}"; do
+    dir="${raw%/}"
+    [ -n "$dir" ] || continue
+    # 정규식·YAML·라벨에 그대로 들어가므로 안전한 문자만 받는다
+    if ! [[ $dir =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ $dir == *//* || $dir == *..* ]]; then
+      err "LOG_DIRS 경로 형식 오류: '$raw' (절대 경로, 영문·숫자·. _ - / 만)"; return 1
     fi
-    local dirs=() raw dir other
-    IFS=',' read -r -a _raw_dirs <<< "$LOG_DIRS"
-    for raw in "${_raw_dirs[@]}"; do
-      dir="${raw%/}"
-      [ -n "$dir" ] || continue
-      # 정규식·YAML·라벨에 그대로 들어가므로 안전한 문자만 받는다
-      if ! [[ $dir =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ $dir == *//* || $dir == *..* ]]; then
-        err "LOG_DIRS 경로 형식 오류: '$raw' (절대 경로, 영문·숫자·. _ - / 만)"; return 1
+    for other in "${dirs[@]+"${dirs[@]}"}"; do
+      if [[ $dir == "$other" || $dir == "$other"/* || $other == "$dir"/* ]]; then
+        err "LOG_DIRS 가 겹칩니다: '$other' 와 '$dir' — 같은 파일을 두 번 보내게 됩니다"; return 1
       fi
-      for other in "${dirs[@]+"${dirs[@]}"}"; do
-        if [[ $dir == "$other" || $dir == "$other"/* || $other == "$dir"/* ]]; then
-          err "LOG_DIRS 가 겹칩니다: '$other' 와 '$dir' — 같은 파일을 두 번 보내게 됩니다"; return 1
-        fi
-      done
-      dirs+=("$dir")
-      [ -d "$dir" ] || log "  [안내] $dir 가 아직 없습니다 — 생기면 10초 안에 수집을 시작합니다."
     done
+    if [ ! -d "$dir" ]; then
+      err "  [건너뜀] $dir 가 없습니다 — 디렉터리가 생긴 뒤 init 을 다시 실행하면 수집을 시작합니다."
+      continue
+    fi
+    dirs+=("$dir")
+  done
+  if [ "${#dirs[@]}" -eq 0 ]; then
+    err "LOG_DIRS 중 존재하는 디렉터리가 없어 파일 로그 수집을 설치하지 않습니다."
+    return 0
+  fi
 
-    local targets="" rules="" re base
-    for dir in "${dirs[@]}"; do
-      re="${dir//./\\\\.}"            # Alloy 문자열 안의 정규식: . → \\.
-      base="${dir##*/}"
-      targets+="    {\"__path__\" = \"/rootfs${dir}/**/*.{${LOG_FILE_EXT}}\"},"$'\n'
-      rules+="  rule {"$'\n'"    source_labels = [\"__path__\"]"$'\n'"    regex         = \"/rootfs${re}/([^/]+)/.+\""$'\n'"    target_label  = \"app\""$'\n'"  }"$'\n'
-      rules+="  rule {"$'\n'"    source_labels = [\"__path__\"]"$'\n'"    regex         = \"/rootfs${re}/[^/]+\""$'\n'"    target_label  = \"app\""$'\n'"    replacement   = \"${base}\""$'\n'"  }"$'\n'
-    done
+  local targets="" rules="" mounts="" re base
+  for dir in "${dirs[@]}"; do
+    re="${dir//./\\\\.}"            # Alloy 문자열 안의 정규식: . → \\.
+    base="${dir##*/}"
+    targets+="    {\"__path__\" = \"/logsrc${dir}/**/*.{${LOG_FILE_EXT}}\"},"$'\n'
+    rules+="  rule {"$'\n'"    source_labels = [\"__path__\"]"$'\n'"    regex         = \"/logsrc${re}/([^/]+)/.+\""$'\n'"    target_label  = \"app\""$'\n'"  }"$'\n'
+    rules+="  rule {"$'\n'"    source_labels = [\"__path__\"]"$'\n'"    regex         = \"/logsrc${re}/[^/]+\""$'\n'"    target_label  = \"app\""$'\n'"    replacement   = \"${base}\""$'\n'"  }"$'\n'
+    mounts+="      - type: bind"$'\n'"        source: ${dir}"$'\n'"        target: /logsrc${dir}"$'\n'"        read_only: true"$'\n'"        bind:"$'\n'"          create_host_path: false"$'\n'
+  done
+  printf '%s' "$mounts" > "$mountfile"
 
-    {
-      printf '// argos-file-logs dirs=%s ext=%s\n' "$(IFS=,; echo "${dirs[*]}")" "$LOG_FILE_EXT"
-      printf 'local.file_match "logvol" {\n  path_targets = [\n%s  ]\n  sync_period = "10s"\n}\n\n' "$targets"
-      printf 'discovery.relabel "logvol" {\n  targets = local.file_match.logvol.targets\n%s' "$rules"
-      cat <<'FILELOG'
+  {
+    printf '// argos-file-logs dirs=%s ext=%s\n' "$(IFS=,; echo "${dirs[*]}")" "$LOG_FILE_EXT"
+    printf 'local.file_match "logvol" {\n  path_targets = [\n%s  ]\n  sync_period = "10s"\n}\n\n' "$targets"
+    printf 'discovery.relabel "logvol" {\n  targets = local.file_match.logvol.targets\n%s' "$rules"
+    cat <<'FILELOG'
   rule {
     target_label = "job"
     replacement  = "file"
@@ -327,10 +355,10 @@ loki.source.file "logvol" {
 loki.process "logvol" {
   forward_to = [loki.write.loki.receiver]
 
-  // filename 라벨의 컨테이너 경로(/rootfs/…)를 호스트 경로로
+  // filename 라벨의 컨테이너 경로(/logsrc/…)를 호스트 경로로
   stage.regex {
     source     = "filename"
-    expression = "^/rootfs(?P<host_path>/.*)$"
+    expression = "^/logsrc(?P<host_path>/.*)$"
   }
   stage.labels {
     values = { filename = "host_path" }
@@ -342,21 +370,48 @@ loki.process "logvol" {
     max_wait_time = "3s"
     max_lines     = 200
   }
+
+  // 전송량 상한 — 파일마다 따로 센다(config.alloy "로그 전송량 상한"과 같은 이유).
+  // 스택트레이스는 위에서 1건으로 묶인 뒤라 줄 수가 아니라 이벤트 수로 센다.
+  stage.limit {
+    rate          = __LOG_RATE__
+    burst         = __LOG_BURST__
+    by_label_name = "filename"
+    // 기본값(10000)을 명시 — 비워 두면 Alloy 가 기동마다 경고를 남긴다
+    max_distinct_labels = 10000
+    drop          = true
+  }
 }
 FILELOG
-    } > "$blockfile"
-    log "파일 로그 수집 활성화: ${dirs[*]} (확장자 ${LOG_FILE_EXT})"
-    log "  설치 시점에 이미 있던 내용은 보내지 않고, 이후 추가분·새 파일만 보냅니다."
+  } > "$blockfile"
+  log "파일 로그 수집 활성화: ${dirs[*]} (확장자 ${LOG_FILE_EXT}) — 별도 컨테이너 argos-alloy-files"
+  log "  설치 시점에 이미 있던 내용은 보내지 않고, 이후 추가분·새 파일만 보냅니다."
+
+  # 메인과 같은 Alloy 버전이어야 한다 — 한쪽만 올리면 위치 파일 형식이 어긋날 수 있다
+  local img_main img_files
+  img_main=$(sed -n 's/^ *image: *\(grafana\/alloy:[^ ]*\).*/\1/p' "$d/docker-compose.yml" | head -1)
+  img_files=$(sed -n 's/^ *image: *\(grafana\/alloy:[^ ]*\).*/\1/p' "$COMPOSE_SRC/docker-compose.files.yml" | head -1)
+  if [ -z "$img_main" ] || [ "$img_main" != "$img_files" ]; then
+    err "Alloy 이미지가 다릅니다: docker-compose.yml=$img_main, docker-compose.files.yml=$img_files — 같은 버전으로 맞추세요."
+    rm -f "$blockfile" "$mountfile"; return 1
   fi
 
+  # 치환할 블록은 여러 줄이라 awk -v 로 넘길 수 없다(BSD awk) — 임시 파일을 getline 으로 읽는다
   awk -v bf="$blockfile" '
     $0 == "__FILE_LOG_BLOCK__" {
       while ((getline line < bf) > 0) print line
       close(bf); next
     }
     { print }
-  ' "$d/config.alloy" > "$tmp" && mv "$tmp" "$d/config.alloy"
-  rm -f "$blockfile"
+  ' "$COMPOSE_SRC/config-files.alloy" > "$tmp" && mv "$tmp" "$cfg" && chmod 644 "$cfg"
+  awk -v mf="$mountfile" '
+    $0 == "__LOG_DIR_MOUNTS__" {
+      while ((getline line < mf) > 0) print line
+      close(mf); next
+    }
+    { print }
+  ' "$COMPOSE_SRC/docker-compose.files.yml" > "$tmp" && mv "$tmp" "$ovr" && chmod 644 "$ovr"
+  rm -f "$blockfile" "$mountfile"
 }
 
 # ─────────── config.alloy placeholder 치환 ───────────
@@ -377,7 +432,7 @@ apply_log_filter() {
 // ── 컨테이너 로그 필터 (LOG_KEEP_REGEX 지정 시에만 생성됨) ──
 // 주의: 여기서 drop 된 줄은 복구할 수 없다.
 loki.process "container_filter" {
-  forward_to = [loki.write.loki.receiver]
+  forward_to = [loki.process.docker_limit.receiver]
 
   // 스택트레이스를 먼저 한 덩어리로 묶는다. 순서가 뒤바뀌면 첫 줄만 남고
   // "at com.foo..." 본문이 전부 버려진다.
@@ -397,7 +452,7 @@ FILTER
     log "  journald(시스템 로그)에는 적용되지 않습니다 — 보안 감사 로그 보호."
     log "  버려진 줄 수 확인: curl -s localhost:12345/metrics | grep loki_process_dropped_lines_total"
   else
-    sink="loki.write.loki.receiver"
+    sink="loki.process.docker_limit.receiver"
   fi
 
   # 치환할 블록은 여러 줄이라 awk -v 로 넘길 수 없다(BSD awk 는 -v 값의 개행을
@@ -412,10 +467,22 @@ FILTER
   ' "$d/config.alloy" > "$tmp" && mv "$tmp" "$d/config.alloy"
   rm -f "$blockfile"
 
-  if grep -q '__[A-Z_]*__' "$d/config.alloy"; then
-    err "config.alloy 에 치환되지 않은 placeholder 가 남았습니다: $d/config.alloy"
-    return 1
-  fi
+}
+
+# ─────────── 로그 전송량 상한 치환 (__LOG_RATE__ / __LOG_BURST__) ───────────
+# 마지막 단계라 남은 placeholder 검사도 여기서 한다.
+apply_rate_limit() {
+  local d="$1" f
+  for f in "$d/config.alloy" "$d/config-files.alloy"; do
+    [ -f "$f" ] || continue
+    sed -e "s/__LOG_RATE__/${LOG_RATE}/g" -e "s/__LOG_BURST__/${LOG_BURST}/g" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    chmod 644 "$f"
+    if grep -q '__[A-Z_]*__' "$f"; then
+      err "치환되지 않은 placeholder 가 남았습니다: $f"
+      return 1
+    fi
+  done
+  log "로그 전송량 상한: 컨테이너·파일마다 초당 ${LOG_RATE}줄(순간 ${LOG_BURST}줄), journald 는 2배 — 넘치면 버림"
 }
 
 # ─────────── .env 생성 (런타임 값만) ───────────
@@ -506,11 +573,17 @@ log "설치 파일 준비 완료."
 install_cmd_audit || err "명령 감사 설치 실패 — 에이전트 기동은 계속합니다."
 
 if [ "$COMPOSE_UP" = "1" ]; then
-  log "기동: docker compose up -d ($BASE_DIR)"
-  ( cd "$BASE_DIR" && docker compose up -d )
+  # --force-recreate: config.alloy 는 파일 바인드라 내용이 바뀌어도 compose 는 "변경 없음"으로 보고
+  #   컨테이너를 그대로 둔다. 게다가 init 은 파일을 새로 써서 교체하므로(inode 변경) 돌고 있는 Alloy 는
+  #   계속 옛 파일을 본다 — init 을 다시 돌려도 새 설정(필터·상한 등)이 적용되지 않았다(실측).
+  #   읽기 위치는 볼륨에 있어 다시 만들어도 중복·유실 없이 이어 읽는다. 중단은 수 초.
+  # --remove-orphans: LOG_DIRS 를 빼고 다시 설치하면 override 가 사라져 argos-alloy-files 가
+  #   고아 컨테이너로 남는다. 그걸 내린다.
+  log "기동: docker compose up -d --force-recreate --remove-orphans ($BASE_DIR)"
+  ( cd "$BASE_DIR" && docker compose up -d --force-recreate --remove-orphans )
   log "기동 완료."
 else
-  log "COMPOSE_UP=0 → 기동 건너뜀. 수동 기동: cd $BASE_DIR && docker compose up -d"
+  log "COMPOSE_UP=0 → 기동 건너뜀. 수동 기동: cd $BASE_DIR && docker compose up -d --force-recreate --remove-orphans"
 fi
 
 # ─────────────────────────── 안내 ───────────────────────────
@@ -526,6 +599,8 @@ cat <<TIP
    ${BASE_DIR}/
    ├── docker-compose.yml   # Alloy + autoheal  ← 원본: compose/docker-compose.yml
    ├── config.alloy         # Alloy 수집 설정    ← 원본: compose/config.alloy
+   ├── config-files.alloy   # 파일 로그 수집 설정 (LOG_DIRS 지정 시)   ← 원본: compose/config-files.alloy
+   ├── docker-compose.override.yml  # 파일 로그 컨테이너 (LOG_DIRS 지정 시) ← 원본: compose/docker-compose.files.yml
    └── .env                 # 런타임 변수        ← init 이 생성
 
  구성을 바꾸려면:

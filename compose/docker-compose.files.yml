@@ -1,0 +1,58 @@
+# ArgosOpen Agent — 애플리케이션 로그 파일 수집 컨테이너 (LOG_DIRS 지정 시에만)
+#
+# 이 파일이 유일한 정답(single source of truth)이다. LOG_DIRS 가 있으면 init 이 이 파일을
+# 설치 경로의 docker-compose.override.yml 로 복사하고 __LOG_DIR_MOUNTS__ 를 디렉터리 마운트로 바꾼다.
+# docker compose 는 override 파일을 자동으로 함께 읽는다. LOG_DIRS 없이 다시 설치하면 init 이
+# override 를 지우고, 기동할 때 --remove-orphans 로 이 컨테이너도 내린다.
+#
+# 메인 Alloy 와 나눈 이유는 config-files.alloy 머리 주석(링크로 root 전용 파일 유출 차단).
+# 그래서 여기에는 LOG_DIRS 디렉터리 말고는 호스트의 어떤 것도 마운트하지 않는다.
+# 이미지 버전은 docker-compose.yml 의 alloy 와 같아야 한다(init 이 다르면 중단한다).
+services:
+  alloy-files:
+    image: grafana/alloy:v1.18.0
+    container_name: argos-alloy-files
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/etc/alloy/alloy-start.sh"]
+    command:
+      - run
+      # UI·헬스체크용 포트. 외부에 열 이유가 없어 컨테이너 안 루프백에만 둔다(ports 없음).
+      - --server.http.listen-addr=127.0.0.1:12345
+      # 이미지의 /var/lib/alloy/data 는 alloy 계정 소유(770)라 쓰기 권한을 뺀 root 로는 못 쓴다.
+      # 이미지에 없는 경로를 쓰면 새 볼륨이 root 소유로 만들어진다.
+      - --storage.path=/alloy-data
+      - /etc/alloy/config.alloy
+    environment:
+      LOKI_ENDPOINT: ${LOKI_ENDPOINT}
+      INSTANCE_ID: ${INSTANCE_ID}
+      NODE_NAME: ${NODE_NAME}
+    # root 의 권한 중 "남의 파일 읽기"(DAC_READ_SEARCH)만 남긴다.
+    # 앱 로그는 앱 계정 소유(예: tomcat 640)라 읽기 권한은 필요하지만, 쓰기·소유권 변경 등은 필요 없다.
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./config-files.alloy:/etc/alloy/config.alloy:ro
+      - ./alloy-start.sh:/etc/alloy/alloy-start.sh:ro
+      - alloy-files-data:/alloy-data
+      # 호스트 디렉터리 D → 컨테이너 /logsrc/D (읽기 전용). 하위 마운트까지 따라간다.
+      # create_host_path: false — 디렉터리가 없을 때 Docker 가 root 소유 빈 디렉터리를 만들면
+      # 나중에 앱이 거기에 로그를 못 쓴다. init 은 없는 디렉터리를 아예 빼고 경고한다.
+__LOG_DIR_MOUNTS__
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/12345"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    labels:
+      - "autoheal=true"
+    networks: [argos]
+
+volumes:
+  alloy-files-data:

@@ -50,9 +50,11 @@ install_files() {
 
 ### 치환 토큰
 
-`config.alloy`에는 대문자+밑줄 형태의 치환 토큰 두 개가 있습니다.
-`init`이 `LOG_KEEP_REGEX` 값에 따라 로그 수신자와 필터 블록으로 바꿔 넣습니다.
-필터를 안 쓰면 기본 수신자와 빈 줄로 치환됩니다.
+`config.alloy`에는 대문자+밑줄 형태의 치환 토큰이 있습니다.
+- 로그 수신자·필터 블록: `init`이 `LOG_KEEP_REGEX` 값에 따라 바꿔 넣습니다. 필터를 안 쓰면 전송량 상한 단계와 빈 줄로 치환됩니다.
+- 전송량 상한(rate·burst): `LOG_RATE` / `LOG_BURST` 숫자로 바꿉니다.
+
+`config-files.alloy`·`docker-compose.files.yml`의 토큰은 `LOG_DIRS`로 만든 수집 블록·마운트로 바뀝니다.
 
 **직접 편집할 때 그 토큰을 지우지 마세요.** 치환에 실패하면 `init`이 중단됩니다
 — 잘못된 설정이 조용히 배포되는 것보다 낫기 때문입니다.
@@ -100,7 +102,12 @@ cd /opt/argos-agent && sudo docker compose up -d
 vi compose/config.alloy                        # 수집 항목 수정
 KEEP_ENV=1 sudo ./init agent 10.0.0.10         # .env 는 보존하고 파일만 갱신
 cd /opt/argos-agent && sudo docker compose restart
+# 또는 한 번에: KEEP_ENV=1 sudo ./init agent 10.0.0.10 --up
 ```
+
+`--up` 은 컨테이너를 다시 만듭니다(`--force-recreate`). 예전에는 `docker compose up -d` 만 해서
+`config.alloy` 내용이 바뀌어도 돌고 있는 Alloy 가 옛 설정을 계속 썼습니다 — init 을 다시 돌려도
+필터·상한이 적용되지 않았습니다(2026-11-09 실측). 읽기 위치는 볼륨에 있어 다시 만들어도 중복·유실이 없고, 중단은 수 초입니다.
 
 ### init 없이 수동 배포
 
@@ -108,13 +115,14 @@ Docker가 이미 있고 스크립트를 안 쓰고 싶다면:
 
 ```bash
 sudo mkdir -p /opt/argos-agent
-sudo cp compose/docker-compose.yml compose/config.alloy /opt/argos-agent/
+sudo cp compose/docker-compose.yml compose/config.alloy compose/alloy-start.sh /opt/argos-agent/
 sudo cp compose/.env.example /opt/argos-agent/.env
 sudo vi /opt/argos-agent/.env   # 엔드포인트·노드 식별자 채우기
 
-# config.alloy 의 치환 토큰을 직접 처리 (필터를 안 쓸 경우)
-sudo sed -i 's/__DOCKER_SINK__/loki.write.loki.receiver/; /^__FILTER_BLOCK__$/d' \
-  /opt/argos-agent/config.alloy
+# config.alloy 의 치환 토큰을 직접 처리 (필터를 안 쓸 경우, 전송량 상한 기본값)
+sudo sed -i 's/__DOCKER_SINK__/loki.process.docker_limit.receiver/; /^__FILTER_BLOCK__$/d;
+             s/__LOG_RATE__/100/g; s/__LOG_BURST__/1000/g' /opt/argos-agent/config.alloy
+# 파일 로그(LOG_DIRS)는 수동 배포를 지원하지 않습니다 — init 을 쓰세요.
 
 cd /opt/argos-agent && sudo docker compose up -d
 ```
@@ -128,15 +136,62 @@ cd /opt/argos-agent && sudo docker compose up -d
 | 로그 | 컨테이너 stdout/stderr | docker.sock tail |
 | 로그 | systemd journal (SSH, sudo 등) | journald |
 | 감사 | 명령 실행 기록 | cmdaudit (PROMPT_COMMAND → journald) |
-| 로그 | 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`, 기본 꺼짐) | loki.source.file |
+| 로그 | 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`, 기본 꺼짐) | loki.source.file (별도 컨테이너) |
 
 모든 시계열·로그에 `instance`(고유 식별자)와 `node`(사람이 읽는 이름) 라벨이 붙습니다.
 호스트 메트릭은 `job=node`로 정규화됩니다.
+
+### 로그 전송량 상한
+
+모든 로그는 노드에서 초당 줄 수 상한을 걸고 보냅니다. 넘친 줄은 **버립니다**.
+
+| 대상 | 단위 | 기본값 |
+|---|---|---|
+| 컨테이너 로그 | 컨테이너마다 | 초당 100줄, 순간 1000줄 |
+| 애플리케이션 로그 파일 | 파일마다 (스택트레이스는 1건) | 초당 100줄, 순간 1000줄 |
+| journald | 노드 전체 | 초당 200줄, 순간 2000줄 (2배) |
+
+```bash
+sudo LOG_RATE=200 LOG_BURST=2000 ./init agent 10.0.0.10 --up   # 값 조정
+```
+
+- **왜**: 중앙 Loki 는 테넌트가 하나라 수집 한도(기본 초당 4MB)를 모든 노드가 함께 씁니다.
+  상한이 없으면 컨테이너 하나가 에러 루프로 쏟아낸 로그를 Alloy 가 버리지 않고 전부 밀어 넣습니다.
+  dind 실측(2026-11-09, 1KB 줄을 20초간 최대 속도로 출력):
+
+  | | 상한 없음 (이전) | 상한 있음 (기본값) |
+  |---|---|---|
+  | 중앙 도착 (측정 시점까지) | 81만 줄, 그 뒤로도 계속 밀려 들어감 | 약 4천 줄로 끝 |
+  | 중앙 Loki 의 한도 초과 거부(429) | 25만 건 | 0 |
+  | 옆 컨테이너 로그 (1초 1줄 × 90) | 90/90 | 90/90 |
+  | 다른 노드의 작은 push 90회 | 89회 성공, 1회 타임아웃 | 90회 성공 |
+
+  다른 노드가 막히는 것까지는 재현되지 않았습니다. 실제 피해는 중앙이 수 GB 를 받아 디스크·S3·조회 부하를
+  떠안는 것과, 그 노드의 전송이 수십 분 밀리는 것입니다.
+- **폭주한 것만 잘립니다.** 컨테이너·파일마다 따로 세기 때문에, 한 컨테이너가 초당 2000줄을 쏟아내는
+  동안에도 옆 컨테이너의 로그는 한 줄도 빠지지 않았습니다(dind 실측: 초당 1줄 120줄 → 120줄 도착).
+- 버리지 않고 기다리게 하면 대기열이 밀려 모든 로그가 늦게 도착하므로 버리는 쪽을 택했습니다.
+- 필터(`LOG_KEEP_REGEX`)를 쓰면 필터를 통과한 줄만 셉니다.
+- 버려진 줄 수 (컨테이너·journald): `curl -s localhost:12345/metrics | grep loki_process_dropped_lines`
+  — `loki_process_dropped_lines_by_label_total{label_value="<컨테이너>"}` 로 어느 컨테이너가 잘렸는지 보입니다.
+  파일 로그는 `docker exec argos-alloy-files bash -c 'exec 3<>/dev/tcp/127.0.0.1/12345; printf "GET /metrics HTTP/1.0\r\n\r\n" >&3; cat <&3' | grep dropped`
 
 ### 애플리케이션 로그 파일 (설치 옵션 `LOG_DIRS`)
 
 앱이 디스크에 직접 쓰는 파일 로그를 중앙 Loki 로 보냅니다. **기본은 꺼져 있고**, 설치할 때 디렉터리를 주면 켜집니다.
 환경마다 로그 위치가 다르므로 경로는 옵션으로 받습니다.
+
+켜면 **별도 컨테이너 `argos-alloy-files`** 가 수집합니다. 이 컨테이너에는 지정한 디렉터리만
+`/logsrc/<경로>` 에 읽기 전용으로 붙고, 도커 소켓·호스트 `/`·`/var/lib/docker` 는 없습니다.
+권한도 root 의 "남의 파일 읽기"(`DAC_READ_SEARCH`) 하나만 남겼습니다.
+
+> **왜 나눴나**: 메인 Alloy 는 cAdvisor 때문에 호스트 `/` 전체를 보고 root 로 돕니다. 같은 컨테이너가
+> 로그 파일을 읽으면, 로그 폴더에 쓸 수 있는 앱 계정(또는 앱 취약점으로 들어온 공격자)이
+> `x.log -> /etc/shadow` 같은 링크 하나로 root 전용 파일을 중앙 Loki 로 보낼 수 있었습니다.
+> Grafana 에 로그인할 수 있는 사람은 누구나 그 내용을 봅니다. 지금은 링크가 컨테이너 안에서 풀려
+> 호스트의 다른 파일에 닿지 않습니다(dind 실측: 절대·상대·`/rootfs` 경로 링크 3종 모두 전송 0건).
+> 막힌 링크는 Alloy 로그에 `error getting os stat … no such file or directory` 로 10초마다 남습니다 —
+> 누군가 로그 폴더에 링크를 심었다는 신호이니 확인하세요.
 
 ```bash
 sudo LOG_DIRS=/log ./init agent 10.0.0.10 --up
@@ -160,8 +215,13 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 - **켜는 시점에 이미 있던 내용은 보내지 않고**, 그 뒤 추가분과 새로 생긴 파일(첫 줄부터)만 보냅니다.
   `alloy-start.sh` 가 기동 때 기존 파일의 현재 크기를 읽기 위치로 기록합니다. 디렉터리마다 한 번이라,
   나중에 디렉터리를 추가하면 그 디렉터리만 그 시점 기준으로 기록합니다.
-- 지정한 디렉터리가 아직 없어도 에러 없이 기다리다가, 생기면 10초 안에 수집을 시작합니다.
-  단 Alloy 가 뜬 **뒤에** 마운트된 볼륨은 보이지 않습니다 — 그 경우 `docker compose restart alloy`.
+- **설치할 때 없는 디렉터리는 빼고 경고합니다.** 디렉터리가 생긴 뒤 `init` 을 다시 실행하면 추가됩니다.
+  (없는 경로를 마운트하면 Docker 가 root 소유 빈 디렉터리를 만들어, 나중에 앱이 거기에 로그를 못 씁니다.)
+  디렉터리 **안의** 새 파일·하위 폴더는 10초 안에 수집을 시작합니다.
+- Alloy 가 뜬 **뒤에** 그 디렉터리 아래에 마운트된 볼륨은 보이지 않습니다 — 그 경우 `docker compose restart alloy-files`.
+- `LOG_DIRS` 없이 다시 설치하면 `argos-alloy-files` 를 내립니다(`--up` 시 `--remove-orphans`).
+- **이전 버전(메인 Alloy 가 파일을 읽던 구조)에서 올릴 때** 읽기 위치를 넘겨받지 않으므로, 전환 순간
+  약 10초 동안 쓰인 줄이 빠집니다(dind 실측: 1초마다 쓴 60줄 중 10줄 누락, 중복 0). 한 번뿐입니다.
 - 경로는 절대 경로, 영문·숫자·`. _ - /` 만 받습니다. 서로 겹치는 디렉터리(`/log` 와 `/log/tomcat`)는 거부합니다.
 
 ## 프로젝트 구조
@@ -171,6 +231,8 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 ├── compose/                    # ★ 실제 배포되는 파일 (여기가 정답)
 │   ├── docker-compose.yml      # Alloy + autoheal
 │   ├── config.alloy            # Alloy 수집 설정
+│   ├── docker-compose.files.yml  # 파일 로그 컨테이너 (LOG_DIRS 지정 시 override 로 설치)
+│   ├── config-files.alloy      # 파일 로그 수집 설정 (LOG_DIRS 지정 시)
 │   ├── alloy-start.sh          # Alloy 기동 래퍼 (파일 로그 첫 읽기 위치 기록)
 │   └── .env.example            # 환경변수 템플릿
 └── README.md
@@ -182,6 +244,8 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 ├── docker-compose.yml          # compose/ 에서 복사 (내용 동일)
 ├── config.alloy                # compose/ 에서 복사 + 치환 토큰 처리
 ├── alloy-start.sh              # compose/ 에서 복사 (내용 동일)
+├── config-files.alloy          # LOG_DIRS 지정 시: compose/ 에서 복사 + 디렉터리별 수집 규칙
+├── docker-compose.override.yml # LOG_DIRS 지정 시: docker-compose.files.yml + 디렉터리 마운트 (compose 가 자동으로 함께 읽음)
 └── .env                        # init 이 생성 (엔드포인트·노드 식별자, 0600)
 ```
 
@@ -190,6 +254,7 @@ sudo LOG_DIRS=/log LOG_FILE_EXT=log,out ./init agent 10.0.0.10 --up    # 확장�
 | 컨테이너 | 이미지 | 역할 |
 |---------|--------|------|
 | `argos-alloy` | `grafana/alloy:v1.18.0` | 메트릭·로그 수집 후 push. healthcheck: `:12345/-/ready` |
+| `argos-alloy-files` | `grafana/alloy:v1.18.0` | 애플리케이션 로그 파일 수집 (`LOG_DIRS` 지정 시에만). 포트 없음 |
 | `argos-autoheal` | `willfarrell/autoheal@sha256:b9b7a5e…` | healthcheck 실패 시 자동 재시작 |
 
 `latest`를 쓰지 않고 고정합니다 — 노드마다 다른 버전이 깔리는 걸 막기 위함입니다.
@@ -199,7 +264,8 @@ autoheal 만 태그가 아니라 digest 로 고정했습니다. 버전 태그가
 `latest` 는 계속 갱신되는(사실상 main) 이미지라, "지금 돌고 있는 내용"을 그대로 굳히려면
 digest 가 유일한 방법입니다.
 
-업그레이드는 `compose/docker-compose.yml`을 고쳐 커밋으로 남깁니다.
+업그레이드는 `compose/docker-compose.yml`을 고쳐 커밋으로 남깁니다. `compose/docker-compose.files.yml` 의
+Alloy 버전도 같이 올려야 합니다 — 둘이 다르면 `init` 이 파일 로그 설치를 중단합니다.
 `docker compose pull`만으로는 버전이 올라가지 않습니다.
 
 `restart: unless-stopped`는 프로세스가 죽었을 때만 살립니다. Alloy가 살아는 있지만
@@ -223,7 +289,7 @@ curl -s localhost:12345/-/ready     # Alloy 헬스
 
 | 플래그 | 기본 | 설명 |
 |--------|------|------|
-| `--up` | — | 마지막에 `docker compose up -d` 까지 수행 |
+| `--up` | — | 마지막에 `docker compose up -d --force-recreate --remove-orphans` 까지 수행 |
 | `--no-up` | ✔ | 기동하지 않음 (기본값, 명시용) |
 
 | 환경변수 | 기본 | 설명 |
@@ -241,6 +307,8 @@ curl -s localhost:12345/-/ready     # Alloy 헬스
 | `LOG_KEEP_REGEX` | (없음) | 컨테이너 로그 필터 |
 | `LOG_DIRS` | (없음 = 수집 안 함) | 파일 로그 수집 디렉터리, 콤마로 여러 개 (`--log-dir=<경로>` 와 같음) |
 | `LOG_FILE_EXT` | `log,out,txt` | 파일 로그 확장자 |
+| `LOG_RATE` | `100` | 로그 전송량 상한: 컨테이너·파일마다 초당 줄 수 (journald 는 2배) |
+| `LOG_BURST` | `1000` | 로그 전송량 상한: 순간 허용 줄 수 (journald 는 2배) |
 
 ```bash
 INSTALL_DOCKER=0 sudo ./init agent 10.0.0.10          # Docker 이미 있음
